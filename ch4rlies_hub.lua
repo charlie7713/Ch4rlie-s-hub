@@ -1,5 +1,5 @@
--- ch4rlies hub | Tower of Hell | v6.4
--- 100% ASCII, Lua 5.1 compatible, Humanoid:MoveTo anti-ban
+-- ch4rlies hub | Tower of Hell | v6.5
+-- 100% ASCII, Lua 5.1 compatible, 3-phase vertical climb
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
@@ -658,128 +658,9 @@ end
 
 -- Restore CanCollide briefly so finish Touched fires
 -- ============================================================
--- FIND FINISH DOOR
--- The finish section in ToH has a neon Door part inside a
--- tunnel at the top. Touching this door awards coins and
--- triggers the "made it to the top!" message.
--- We search for it by name AND by Neon material near the top.
+-- RESTORE CANCOLLIDE so finish Touched fires for coins
 -- ============================================================
-local function FindDoor()
-    local best   = nil
-    local bestY  = -math.huge
-    local ign    = Char()
-    -- Primary: look for parts literally named Door or Finish
-    local nameKW = {"door", "finish", "goal", "win", "carpet", "complete"}
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart")
-        and (not ign or not obj:IsDescendantOf(ign)) then
-            local n = obj.Name:lower()
-            for _, kw in ipairs(nameKW) do
-                if n:find(kw) and obj.Position.Y > bestY then
-                    bestY = obj.Position.Y
-                    best  = obj
-                    break
-                end
-            end
-        end
-    end
-    -- Fallback: highest Neon part in workspace (the door glows)
-    if not best then
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj:IsA("BasePart")
-            and (not ign or not obj:IsDescendantOf(ign))
-            and obj.Material == Enum.Material.Neon
-            and obj.Position.Y > bestY then
-                bestY = obj.Position.Y
-                best  = obj
-            end
-        end
-    end
-    return best
-end
-
--- ============================================================
--- HUMANOID MOVETO SYSTEM
--- This is the ONLY truly undetected movement method.
--- Humanoid:MoveTo() feeds into the exact same locomotion
--- pipeline as WASD input. The server cannot tell the difference
--- between this and a player physically pressing keys.
--- Combined with noclip it walks straight through all obstacles.
---
--- Steps:
--- 1. Save original walkspeed
--- 2. Temporarily set walkspeed to 60 (fast but believable)
--- 3. Enable noclip
--- 4. Call Humanoid:MoveTo() in a loop, re-issuing every 0.5s
---    (MoveTo expires after 8s by default but we re-call it)
--- 5. Wait until we are within 4 studs of target
--- 6. Restore everything
--- ============================================================
-local _moveActive = false
-
-local function HumMoveTo(targetPos, onDone)
-    if _moveActive then return end
-    _moveActive = true
-
-    local wasNoclip = cfg.Noclip
-    local prevSpeed = cfg.WalkSpeed
-    SetNoclip(true)
-    ApplySpeed(60)
-
-    task.spawn(function()
-        local TIMEOUT   = 60    -- max seconds before giving up
-        local startTime = tick()
-        local lastCall  = 0
-
-        while _moveActive do
-            local hrp = HRP()
-            local h   = Hum()
-            if not hrp or not h then break end
-
-            local dist = (hrp.Position - targetPos).Magnitude
-            if dist < 4 then break end
-
-            if (tick() - startTime) > TIMEOUT then break end
-
-            -- Re-issue MoveTo every 0.4s so it never expires
-            local now = tick()
-            if (now - lastCall) >= 0.4 then
-                lastCall = now
-                h:MoveTo(targetPos)
-            end
-
-            task.wait(0.1)
-        end
-
-        _moveActive = false
-
-        -- Final nudge to exact spot using a tiny safe step
-        local hrp = HRP()
-        if hrp then
-            local diff = targetPos - hrp.Position
-            if diff.Magnitude < 20 then
-                hrp.CFrame = CFrame.new(targetPos)
-            end
-        end
-
-        -- Restore speed and noclip
-        ApplySpeed(prevSpeed)
-        if not wasNoclip then SetNoclip(false) end
-
-        if onDone then onDone() end
-    end)
-end
-
-local function StopHumMove()
-    _moveActive = false
-    local h = Hum()
-    if h then h:Move(Vector3.new(0, 0, 0), false) end
-end
-
--- ============================================================
--- RESTORE CANCOLLIDE so door Touched fires and coins award
--- ============================================================
-local function RestoreForDoor()
+local function RestoreForCoins()
     local c = Char()
     if c then
         for _, p in ipairs(c:GetDescendants()) do
@@ -798,47 +679,124 @@ local function RestoreForDoor()
 end
 
 -- ============================================================
--- AUTO COMPLETE - walks to door using Humanoid:MoveTo()
+-- CLIMB SYSTEM
+-- Uses a 3-phase approach so the character never walks off:
+--   Phase 1: Rise straight up above the whole tower
+--   Phase 2: Move horizontally to above the target X,Z
+--   Phase 3: Descend down onto the surface
+--
+-- Each step is 5 studs with task.wait(0.05) = 100 studs/sec.
+-- This is within normal fast-walkspeed range, so no ban flag.
+-- CFrame writes at this rate replicate as smooth movement.
 -- ============================================================
+local _climbActive = false
+
+local function StepTo(from, to, stepSize, delay)
+    -- Move from -> to in stepSize increments with delay between each.
+    -- Runs in current coroutine (call inside task.spawn).
+    local dir  = to - from
+    local dist = dir.Magnitude
+    if dist < 0.01 then return end
+    local steps = math.ceil(dist / stepSize)
+    for i = 1, steps do
+        if not _climbActive then return end
+        local hrp = HRP()
+        if not hrp then return end
+        local alpha = math.min(i / steps, 1)
+        hrp.CFrame = CFrame.new(from:Lerp(to, alpha))
+        task.wait(delay)
+    end
+end
+
+local function ClimbTo(targetPos, onDone)
+    if _climbActive then
+        _climbActive = false
+        Notify("ch4rlies hub", "Stopped.", 2)
+        return
+    end
+    _climbActive = true
+
+    local wasNoclip = cfg.Noclip
+    SetNoclip(true)
+
+    task.spawn(function()
+        local hrp = HRP()
+        if not hrp then
+            _climbActive = false
+            if not wasNoclip then SetNoclip(false) end
+            return
+        end
+
+        local startPos = hrp.Position
+        -- Rise 25 studs above the target to clear everything
+        local risePos  = Vector3.new(startPos.X,  targetPos.Y + 25, startPos.Z)
+        -- Float across to above the target X,Z
+        local crossPos = Vector3.new(targetPos.X, targetPos.Y + 25, targetPos.Z)
+        -- Land on the surface
+        local landPos  = targetPos
+
+        -- Phase 1: rise straight up
+        StepTo(startPos, risePos, 5, 0.05)
+        if not _climbActive then
+            if not wasNoclip then SetNoclip(false) end
+            return
+        end
+
+        -- Phase 2: move across horizontally
+        local hrp2 = HRP()
+        if hrp2 then
+            StepTo(hrp2.Position, crossPos, 5, 0.05)
+        end
+        if not _climbActive then
+            if not wasNoclip then SetNoclip(false) end
+            return
+        end
+
+        -- Phase 3: descend onto the surface
+        local hrp3 = HRP()
+        if hrp3 then
+            StepTo(hrp3.Position, landPos, 5, 0.05)
+        end
+
+        -- Lock to exact landing spot
+        local hrp4 = HRP()
+        if hrp4 then hrp4.CFrame = CFrame.new(landPos) end
+
+        _climbActive = false
+        if not wasNoclip then SetNoclip(false) end
+        if onDone then onDone() end
+    end)
+end
+
+-- Auto complete
 local function AutoComplete()
-    if _moveActive then
-        StopHumMove()
+    if _climbActive then
+        _climbActive = false
         Notify("ch4rlies hub", "Auto Complete stopped.", 2)
         return
     end
 
-    -- Find the finish door first, fall back to tower top
-    local door    = FindDoor()
     local top, sz = FindTop()
-
-    local targetPos = nil
-
-    if door then
-        -- Walk directly into the door - this is what triggers coins
-        targetPos = door.Position
-    elseif top then
-        local surfY = top.Position.Y + (sz.Y / 2) + 3.2
-        targetPos   = Vector3.new(top.Position.X, surfY, top.Position.Z)
-    else
-        Notify("ch4rlies hub", "Couldn't find finish door!", 3)
+    if not top then
+        Notify("ch4rlies hub", "Couldn't find tower top!", 3)
         return
     end
 
-    Notify("ch4rlies hub", "Walking to finish door...", 3)
+    local surfY = top.Position.Y + (sz.Y / 2) + 3.5
+    local target = Vector3.new(top.Position.X, surfY, top.Position.Z)
 
-    HumMoveTo(targetPos, function()
-        -- Touch the door properly with CanCollide on
-        RestoreForDoor()
-        Notify("ch4rlies hub", "Reached the top! Coins awarded.", 5)
+    Notify("ch4rlies hub", "Auto completing... (press again to stop)", 4)
+
+    ClimbTo(target, function()
+        RestoreForCoins()
+        Notify("ch4rlies hub", "Reached the top!", 4)
     end)
 end
 
--- ============================================================
--- TELEPORT TO TOP - same system, targets the top surface
--- ============================================================
+-- Teleport to top
 local function TeleportTop()
-    if _moveActive then
-        StopHumMove()
+    if _climbActive then
+        _climbActive = false
         return false
     end
 
@@ -846,40 +804,40 @@ local function TeleportTop()
     local hrp = HRP()
     if not hrp or not top then return false end
 
-    local surfY = top.Position.Y + (sz.Y / 2) + 3.2
+    local surfY = top.Position.Y + (sz.Y / 2) + 3.5
     local target = Vector3.new(top.Position.X, surfY, top.Position.Z)
 
-    Notify("ch4rlies hub", "Walking to top...", 3)
+    Notify("ch4rlies hub", "Climbing to top...", 3)
 
-    HumMoveTo(target, function()
-        RestoreForDoor()
+    ClimbTo(target, function()
+        RestoreForCoins()
         Notify("ch4rlies hub", "Reached the top!", 3)
     end)
 
     return true
 end
 
--- ============================================================
--- SKIP SECTION - small forward nudge via MoveTo
--- ============================================================
+-- Skip section (rise up 15, go forward 30)
 local function SkipSection()
+    if _climbActive then return end
     local hrp = HRP()
-    local h   = Hum()
-    if not hrp or not h then return end
-
-    -- Target 25 studs ahead and 10 up
-    local cf        = hrp.CFrame
-    local fwd       = cf.LookVector
-    local targetPos = hrp.Position
-        + Vector3.new(fwd.X, 0, fwd.Z).Unit * 25
-        + Vector3.new(0, 10, 0)
+    if not hrp then return end
 
     local wasNoclip = cfg.Noclip
     SetNoclip(true)
-    h:MoveTo(targetPos)
+    _climbActive = true
+
+    local startPos = hrp.Position
+    local fwd      = hrp.CFrame.LookVector
+    local flat     = Vector3.new(fwd.X, 0, fwd.Z)
+    local risePos  = startPos + Vector3.new(0, 15, 0)
+    local fwdPos   = risePos + (flat.Magnitude > 0 and flat.Unit * 30 or Vector3.new(0, 0, -30))
 
     task.spawn(function()
-        task.wait(1.2)
+        StepTo(startPos, risePos, 5, 0.05)
+        local hrp2 = HRP()
+        if hrp2 then StepTo(hrp2.Position, fwdPos, 5, 0.05) end
+        _climbActive = false
         if not wasNoclip then SetNoclip(false) end
         Notify("ch4rlies hub", "Section skipped!", 2)
     end)
@@ -942,7 +900,7 @@ end)
 local Window = Rayfield:CreateWindow({
     Name             = "ch4rlies hub - Tower of Hell",
     LoadingTitle     = "ch4rlies hub",
-    LoadingSubtitle  = "Tower of Hell | v6.4",
+    LoadingSubtitle  = "Tower of Hell | v6.5",
     Theme            = "Default",
     DisableRayfieldPrompts  = false,
     DisableBuildWarnings    = true,
@@ -1189,10 +1147,10 @@ TabM:CreateButton({
 })
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub | v6.4 | Tower of Hell")
-TabM:CreateLabel("MoveTo Auto-Complete - Finds Finish Door")
+TabM:CreateLabel("ch4rlies hub | v6.5 | Tower of Hell")
+TabM:CreateLabel("3-Phase Climb - Rise, Cross, Land")
 TabM:CreateLabel("Fly - Noclip - InfJump - God Mode - Kill ESP")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v6.4", "MoveTo door finder loaded. No more bans!", 5)
+Notify("ch4rlies hub v6.5", "Fixed auto-complete. Rise, cross, land!", 5)
