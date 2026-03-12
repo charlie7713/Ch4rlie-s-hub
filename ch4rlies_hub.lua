@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.3
+-- ch4rlies hub | Tower of Hell | v10.4
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -782,38 +782,40 @@ local function BezierClimb(targetPos, onDone)
         local p0 = hrp.Position
         local p3 = targetPos
 
-        -- Control points: rise above start, then arc to above target
-        -- clearY is 40 studs above the higher of start/target
         local clearY = math.max(p0.Y, p3.Y) + 40
-        local p1 = Vector3.new(p0.X, clearY, p0.Z)  -- above start
-        local p2 = Vector3.new(p3.X, clearY, p3.Z)  -- above target
+        local p1 = Vector3.new(p0.X, clearY, p0.Z)
+        local p2 = Vector3.new(p3.X, clearY, p3.Z)
 
-        -- Calculate approximate arc length for timing
-        local arcLen = (p0-p1).Magnitude + (p1-p2).Magnitude + (p2-p3).Magnitude
+        local arcLen  = (p0-p1).Magnitude + (p1-p2).Magnitude + (p2-p3).Magnitude
         local duration = math.max(arcLen / CLIMB_SPEED, 0.5)
-        local steps    = math.max(math.ceil(duration / 0.033), 15) -- ~30fps
+        local steps    = math.max(math.ceil(duration / 0.033), 15)
 
+        -- Track whether we completed fully vs broke out early
+        local completed = true
         for i = 1, steps do
-            if not _climbActive then break end
+            if not _climbActive then
+                completed = false
+                break
+            end
             local rawT   = i / steps
             local easedT = EaseInOut(rawT)
             local pos    = Bezier3(p0, p1, p2, p3, easedT)
             local hrp2   = HRP()
-            if not hrp2 then break end
-            hrp2.CFrame  = CFrame.new(pos)
-            -- Zero velocity so physics doesn't fight the path
+            if not hrp2 then
+                completed = false
+                break
+            end
+            hrp2.CFrame = CFrame.new(pos)
             hrp2.AssemblyLinearVelocity  = Vector3.new(0,0,0)
             hrp2.AssemblyAngularVelocity = Vector3.new(0,0,0)
             task.wait(duration / steps)
         end
 
-        -- Snap exactly to target
-        local hrp3 = HRP()
-        if hrp3 then hrp3.CFrame = CFrame.new(p3) end
-
         _climbActive = false
         if not wasNoclip then SetNoclip(false) end
-        if onDone then onDone() end
+        -- Only fire onDone if we actually reached the target, not if
+        -- the coroutine was interrupted by a respawn or cancel
+        if completed and onDone then onDone() end
     end)
 end
 
@@ -1211,6 +1213,13 @@ end
 -- RESPAWN HANDLER
 -- ============================================================
 LP.CharacterAdded:Connect(function(char)
+    -- Always kill any in-progress climb from the previous round.
+    -- When ToH respawns us, the old BezierClimb coroutine may still
+    -- be running in the background with _climbActive = true.
+    -- Resetting here prevents round 2's AutoComplete from triggering
+    -- the "already climbing -> cancel" branch.
+    _climbActive = false
+
     task.wait(0.5)
     NullifyKick() DisableKillScript(char) StartMovementGuard()
     local h = Hum()
@@ -1228,24 +1237,64 @@ LP.CharacterAdded:Connect(function(char)
     if cfg.Rainbow     then SetRainbow(true)       end
     if cfg.AutoRespawn then SetAutoRespawn(true)   end
 
-    -- AUTO FARM: if active, wait for the tower to generate this round
-    -- then call AutoComplete() directly - identical to pressing it manually
+    -- AUTO FARM: wait for the NEW tower to be fully generated,
+    -- then call AutoComplete() - identical to pressing it manually.
+    --
+    -- WHY NOT WaitForChild directly:
+    --   workspace.tower exists immediately (old tower still there).
+    --   WaitForChild would resolve instantly with the OLD tower,
+    --   and AutoComplete would target the OLD FinishGlow which
+    --   ToH is about to destroy, landing us in the void.
+    --
+    -- FIX: Wait for workspace.tower to be REMOVED first (confirms
+    --   old round is fully cleaned up), then WaitForChild for the
+    --   new one. This guarantees we are targeting the fresh tower.
     if _autoFarmActive then
         task.spawn(function()
-            -- Use WaitForChild (event-based, not polling) to detect tower ready
+            -- Step 1: wait for the OLD tower to be removed
+            -- (ToH destroys workspace.tower between rounds)
+            local oldTower = workspace:FindFirstChild("tower")
+            if oldTower then
+                -- Listen for it being removed, timeout 15s
+                local removed = false
+                local removeConn
+                removeConn = workspace.ChildRemoved:Connect(function(child)
+                    if child == oldTower then
+                        removed = true
+                        removeConn:Disconnect()
+                    end
+                end)
+                local waited = 0
+                while not removed and waited < 15 do
+                    if not _autoFarmActive then
+                        removeConn:Disconnect()
+                        return
+                    end
+                    task.wait(0.5)
+                    waited = waited + 0.5
+                end
+                removeConn:Disconnect()
+            end
+
+            if not _autoFarmActive then return end
+
+            -- Step 2: wait for the NEW tower and its FinishGlow
             local ok = pcall(function()
                 local tower    = workspace:WaitForChild("tower",    30)
                 local sections = tower:WaitForChild("sections",     30)
                 local finish   = sections:WaitForChild("finish",    30)
                 finish:WaitForChild("FinishGlow", 30)
             end)
-            if not _autoFarmActive then return end
-            -- Small natural delay - same as a human would take to run to tower
+
+            if not ok or not _autoFarmActive then return end
+
+            -- Step 3: small natural delay before climbing
             task.wait(2)
             if not _autoFarmActive then return end
+
             _autoFarmRounds = _autoFarmRounds + 1
             Notify("ch4rlies hub",
-                "Auto Farm: Round ".._autoFarmRounds.." - climbing to finish...", 3)
+                "Auto Farm: Round ".._autoFarmRounds.." - climbing...", 3)
             AutoComplete()
         end)
     end
@@ -1262,11 +1311,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.3",
+    LoadingSubtitle = "Tower of Hell  |  v10.4",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v103"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v104"},
     KeySystem = false,
 })
 
@@ -1581,10 +1630,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.3  |  Tower of Hell")
-TabM:CreateLabel("Auto Farm fixed  |  Fake Lag added")
+TabM:CreateLabel("ch4rlies hub  |  v10.4  |  Tower of Hell")
+TabM:CreateLabel("Auto Farm respawn bug fixed  |  Fake Lag added")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.3","Auto Farm undetectable + Fake Lag added!",5)
+Notify("ch4rlies hub v10.4","Auto Farm respawn bug fixed!",5)
