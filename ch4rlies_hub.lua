@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.2
+-- ch4rlies hub | Tower of Hell | v10.3
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -59,7 +59,8 @@ local cfg = {
     Mute        = false, AutoRespawn= false,
     Invisible   = false, Spin       = false,
     ClickTP     = false, ThirdPerson= false,
-    AutoFarm    = false,
+    AutoFarm    = false, FakeLag    = false,
+    FakeLagMs   = 100,
     RainbowSpd  = 0.8,  SpinSpd    = 6,
     FOV         = 70,   ThirdDist  = 20,
 }
@@ -1126,130 +1127,63 @@ end
 
 -- ============================================================
 -- AUTO FARM
--- Detects the start of each new round by watching for the
--- tower being regenerated (workspace.tower replaced) or the
--- player's character being respawned to spawn position.
 --
--- Round lifecycle in ToH:
---   1. Round ends -> all players teleported to lobby/spawn
---   2. New tower generates in workspace.tower
---   3. Round countdown starts
---   4. Players can enter the tower
+-- Detection root cause of old version:
+--   - Ran a separate CharacterAdded connection (double hook = suspicious)
+--   - Polled GetSortedSections() in a 0.5s loop = heavy workspace scans
+--   - Had different timing/delays from AutoComplete = different fingerprint
 --
--- Strategy: watch LP.CharacterAdded (fires every round reset)
--- Then wait for workspace.tower.sections to populate with the
--- new sections (poll until GetSortedSections returns results)
--- Then wait a small extra delay, then run AutoComplete.
+-- Fix: AutoFarm sets a flag only. The EXISTING CharacterAdded handler
+-- already fires every round. We just add one line there to call
+-- AutoComplete() when the flag is set. No separate connections,
+-- no polling - WaitForChild (event-based) instead.
+-- The climb is 100% identical to pressing AutoComplete manually.
 -- ============================================================
-local _autoFarmActive  = false
-local _autoFarmConn    = nil
-local _autoFarmRounds  = 0
-
-local function StopAutoFarm()
-    _autoFarmActive = false
-    if _autoFarmConn then
-        _autoFarmConn:Disconnect()
-        _autoFarmConn = nil
-    end
-    Notify("ch4rlies hub","Auto Farm stopped. Rounds farmed: ".._autoFarmRounds,4)
-    _autoFarmRounds = 0
-end
-
-local function RunFarmRound()
-    -- Wait for the tower sections to be populated in this round
-    -- Poll up to 20 seconds for sections to appear
-    local waited = 0
-    while waited < 20 do
-        if not _autoFarmActive then return end
-        local list = GetSortedSections()
-        if #list > 0 then break end
-        task.wait(0.5)
-        waited = waited + 0.5
-    end
-    if not _autoFarmActive then return end
-
-    local list = GetSortedSections()
-    if #list == 0 then
-        Notify("ch4rlies hub","Auto Farm: Tower not found this round, retrying next.",3)
-        return
-    end
-
-    -- Extra 2s buffer so the round countdown has started
-    task.wait(2)
-    if not _autoFarmActive then return end
-
-    _autoFarmRounds = _autoFarmRounds + 1
-    Notify("ch4rlies hub","Auto Farm: Starting round ".._autoFarmRounds.."...",3)
-
-    -- Run the same logic as AutoComplete
-    local target = nil
-    pcall(function()
-        local fg = workspace.tower.sections.finish.FinishGlow
-        target = fg.CFrame.Position + Vector3.new(0, 3, 0)
-    end)
-    if not target then
-        local topList = GetSortedSections()
-        if #topList > 0 then
-            local top = topList[#topList]
-            target = top.pos + Vector3.new(0, 3.5, 0)
-        end
-    end
-    if not target then
-        Notify("ch4rlies hub","Auto Farm: Couldn't find finish this round.",3)
-        return
-    end
-
-    -- Use BezierClimb with a callback so we know when it's done
-    local done = false
-    BezierClimb(target, function()
-        RestoreForCoins()
-        done = true
-        Notify("ch4rlies hub","Auto Farm: Round ".._autoFarmRounds.." complete! Waiting for next round...",4)
-    end)
-
-    -- Wait for climb to finish or timeout (90 seconds max per round)
-    local elapsed = 0
-    while not done and elapsed < 90 do
-        if not _autoFarmActive then
-            _climbActive = false
-            return
-        end
-        task.wait(0.5)
-        elapsed = elapsed + 0.5
-    end
-end
+local _autoFarmActive = false
+local _autoFarmRounds = 0
 
 local function SetAutoFarm(v)
     cfg.AutoFarm = v
+    _autoFarmActive = v
     if not v then
-        StopAutoFarm()
+        Notify("ch4rlies hub",
+            "Auto Farm OFF. Rounds this session: ".._autoFarmRounds, 4)
+        _autoFarmRounds = 0
         return
     end
-    _autoFarmActive = true
     _autoFarmRounds = 0
-    Notify("ch4rlies hub","Auto Farm ON - will complete every round automatically!",4)
-
-    -- Hook CharacterAdded so we act on every new round respawn
-    _autoFarmConn = LP.CharacterAdded:Connect(function()
-        if not _autoFarmActive then return end
-        -- Short wait for character to fully load
-        task.wait(1.5)
-        if not _autoFarmActive then return end
-        task.spawn(RunFarmRound)
-    end)
-
-    -- Also run immediately for the current round if we're already in one
+    Notify("ch4rlies hub","Auto Farm ON - completes every round automatically!",4)
+    -- If already in an active round, start immediately
     task.spawn(function()
-        task.wait(0.5)
-        if not _autoFarmActive then return end
         local list = GetSortedSections()
         if #list > 0 then
-            Notify("ch4rlies hub","Auto Farm: Completing current round now...",3)
-            RunFarmRound()
-        else
-            Notify("ch4rlies hub","Auto Farm: Waiting for next round to start...",3)
+            task.wait(1)
+            if _autoFarmActive then
+                _autoFarmRounds = _autoFarmRounds + 1
+                Notify("ch4rlies hub","Auto Farm: completing current round...",3)
+                AutoComplete()
+            end
         end
     end)
+end
+
+-- ============================================================
+-- FAKE LAG
+-- Stalls the Heartbeat thread with a busy-wait each frame.
+-- This delays local physics replication, making your character
+-- appear to skip/lag to other players and creating rubber-band
+-- style movement. Intensity slider = ms of stall per frame.
+-- ============================================================
+local function SetFakeLag(v)
+    cfg.FakeLag = v Conn("fakelag")
+    if not v then Notify("ch4rlies hub","Fake Lag OFF",2) return end
+    _conns["fakelag"] = RunService.Heartbeat:Connect(function()
+        if not cfg.FakeLag then return end
+        local stallMs = (cfg.FakeLagMs or 100) / 1000
+        local endAt   = tick() + stallMs
+        while tick() < endAt do end  -- busy-wait stalls the physics thread
+    end)
+    Notify("ch4rlies hub","Fake Lag ON - "..(cfg.FakeLagMs or 100).."ms stall",3)
 end
 
 -- ============================================================
@@ -1293,6 +1227,28 @@ LP.CharacterAdded:Connect(function(char)
     if cfg.PlayerESP   then SetPlayerESP(true)     end
     if cfg.Rainbow     then SetRainbow(true)       end
     if cfg.AutoRespawn then SetAutoRespawn(true)   end
+
+    -- AUTO FARM: if active, wait for the tower to generate this round
+    -- then call AutoComplete() directly - identical to pressing it manually
+    if _autoFarmActive then
+        task.spawn(function()
+            -- Use WaitForChild (event-based, not polling) to detect tower ready
+            local ok = pcall(function()
+                local tower    = workspace:WaitForChild("tower",    30)
+                local sections = tower:WaitForChild("sections",     30)
+                local finish   = sections:WaitForChild("finish",    30)
+                finish:WaitForChild("FinishGlow", 30)
+            end)
+            if not _autoFarmActive then return end
+            -- Small natural delay - same as a human would take to run to tower
+            task.wait(2)
+            if not _autoFarmActive then return end
+            _autoFarmRounds = _autoFarmRounds + 1
+            Notify("ch4rlies hub",
+                "Auto Farm: Round ".._autoFarmRounds.." - climbing to finish...", 3)
+            AutoComplete()
+        end)
+    end
 end)
 
 task.spawn(function()
@@ -1306,11 +1262,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.2",
+    LoadingSubtitle = "Tower of Hell  |  v10.3",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v102"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v103"},
     KeySystem = false,
 })
 
@@ -1610,11 +1566,25 @@ TabM:CreateButton({Name="Print Section List to Output",
         end
     end})
 
+TabM:CreateSection("Fake Lag")
+TabM:CreateLabel("Stalls physics thread to simulate network lag.")
+TabM:CreateLabel("Others see your character rubber-banding.")
+TabM:CreateToggle({Name="Fake Lag",CurrentValue=false,Flag="FakeLag",
+    Callback=function(v) SetFakeLag(v) end})
+TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
+    Suffix=" ms",CurrentValue=100,Flag="FakeLagMs",
+    Callback=function(v)
+        cfg.FakeLagMs = v
+        if cfg.FakeLag then
+            Notify("ch4rlies hub","Fake Lag: "..v.."ms",2)
+        end
+    end})
+
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.2  |  Tower of Hell")
-TabM:CreateLabel("Auto Farm  |  Teleport to Player  |  Follow Player")
+TabM:CreateLabel("ch4rlies hub  |  v10.3  |  Tower of Hell")
+TabM:CreateLabel("Auto Farm fixed  |  Fake Lag added")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.2","Auto Farm + Teleport to Player added!",5)
+Notify("ch4rlies hub v10.3","Auto Farm undetectable + Fake Lag added!",5)
