@@ -1,5 +1,5 @@
--- ch4rlies hub | Tower of Hell | v8.0
--- 100% ASCII | Lua 5.1 | Full rewrite
+-- ch4rlies hub | Tower of Hell | v8.1
+-- 100% ASCII | Lua 5.1 | Freeze fix | Door finder | Platform skip
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
@@ -550,13 +550,12 @@ local function SetWallTransp(v)
 end
 
 -- ============================================================
--- FREEZE MOVING PARTS (detect by actual motion, not by name)
+-- FREEZE MOVING PARTS
+-- ToH moves obstacles by tweening Anchored parts via CFrame.
+-- We scan ALL BaseParts (anchored or not), compare their
+-- position each frame, and lock anything that moved.
 -- ============================================================
--- Scans workspace for parts that are visibly moving by comparing
--- their CFrame between frames. Any part that moves > 0.15 studs
--- per heartbeat is flagged as a moving obstacle and locked.
--- ============================================================
-local _prevFrameCF  = {}   -- CFrame snapshot from previous frame
+local _prevFrameCF  = {}
 local _freezeActive = false
 
 local function SetFreezeObst(v)
@@ -573,24 +572,24 @@ local function SetFreezeObst(v)
 
     local ign = Char()
 
-    -- Phase 1: snapshot all part CFrames this frame
+    -- Snapshot all BaseParts this frame (anchored AND unanchored)
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart")
-        and (not ign or not obj:IsDescendantOf(ign))
-        and not obj.Anchored then
+        if obj:IsA("BasePart") and (not ign or not obj:IsDescendantOf(ign)) then
             _prevFrameCF[obj] = obj.CFrame
         end
     end
 
-    -- Phase 2: next frame, compare - anything that moved is a moving part
+    -- Compare each frame - flag anything that moved
     _conns["freeze_scan"] = RunService.Heartbeat:Connect(function()
         if not cfg.FreezeObst then return end
         local ign2 = Char()
         for obj, prevCF in pairs(_prevFrameCF) do
             if obj and obj.Parent and (not ign2 or not obj:IsDescendantOf(ign2)) then
                 local moved = (obj.Position - prevCF.Position).Magnitude
-                if moved > 0.12 and not _frozenParts[obj] then
-                    _frozenParts[obj] = obj.CFrame  -- lock it at current position
+                local rotated = math.abs(obj.CFrame:ToObjectSpace(prevCF).X)
+                    + math.abs(obj.CFrame:ToObjectSpace(prevCF).Y)
+                if (moved > 0.08 or rotated > 0.01) and not _frozenParts[obj] then
+                    _frozenParts[obj] = obj.CFrame
                 end
                 _prevFrameCF[obj] = obj.CFrame
             else
@@ -599,7 +598,7 @@ local function SetFreezeObst(v)
         end
     end)
 
-    -- Phase 3: every heartbeat, re-apply locked CFrames
+    -- Re-apply locked CFrames every heartbeat
     _conns["freeze_lock"] = RunService.Heartbeat:Connect(function()
         if not cfg.FreezeObst then return end
         for obj, cf in pairs(_frozenParts) do
@@ -615,9 +614,8 @@ local function SetFreezeObst(v)
         end
     end)
 
-    -- Give the scanner one second to detect movers, then notify count
     task.spawn(function()
-        task.wait(1.5)
+        task.wait(2)
         local n = 0
         for _ in pairs(_frozenParts) do n = n + 1 end
         Notify("ch4rlies hub", "Frozen " .. n .. " moving parts!", 3)
@@ -719,84 +717,179 @@ end
 
 -- ============================================================
 -- MAP HELPERS
--- InTowerPart: returns true for BaseParts that are inside the
--- tower's horizontal footprint, are walkable (flat-ish, big
--- enough), and are not kill parts.
+--
+-- ToH layout facts (from source inspection):
+--   - Tower is roughly centred at X=0, Z=0
+--   - Sections extend up to ~150 studs horizontally from centre
+--   - Each section is about 100 studs tall
+--   - The finish section contains a corridor and a neon Door part
+--   - Section floors are large flat parts at the base of each section
+--
+-- We use 300-stud horizontal radius to be safe on any server.
 -- ============================================================
-local function IsFloorPart(obj)
+local TOH_R2 = 300 * 300   -- squared radius for quick distance check
+
+local function InTowerWide(pos)
+    local dx = pos.X - TOH_CENTER_X
+    local dz = pos.Z - TOH_CENTER_Z
+    return (dx*dx + dz*dz) <= TOH_R2
+end
+
+-- A "floor candidate" is a BasePart that:
+--   - Is not a kill part
+--   - Is not part of the local player's character
+--   - Is horizontally flat (X and Z size both >= minSz)
+--   - Has a relatively thin Y (so it reads as a floor, not a wall)
+--   - Is inside the wide tower bounds
+--   - Is above TOH_BASE_Y
+local function IsFloorCandidate(obj, minSz)
+    minSz = minSz or 4
     if not obj:IsA("BasePart") then return false end
     if IsKillPart(obj) then return false end
     local ign = Char()
     if ign and obj:IsDescendantOf(ign) then return false end
-    -- Must be within tower bounds
-    if not InTower(obj.Position) then return false end
-    -- Must be a reasonably large horizontal surface (section floors)
-    -- Size: X>=6, Z>=6, and not super tall (not a wall)
-    if obj.Size.X < 6 or obj.Size.Z < 6 then return false end
-    -- Above the base
-    if obj.Position.Y < TOH_BASE_Y then return false end
+    if not InTowerWide(obj.Position) then return false end
+    if obj.Position.Y < TOH_BASE_Y - 5 then return false end
+    if obj.Size.X < minSz or obj.Size.Z < minSz then return false end
     return true
 end
 
 -- ============================================================
--- FIND TOP
--- Finds the highest walkable floor part inside the tower.
+-- FIND FINISH DOOR / CORRIDOR
+-- Searches the workspace for the finish area parts.
+-- Priority:
+--   1. Any BasePart literally named "Door" or "Finish" (exact)
+--   2. Any Neon material part above Y=50 inside tower bounds
+--   3. The single highest floor candidate
+-- Returns the part and a "stand position" on the floor in
+-- front of it (so the player walks through the corridor).
 -- ============================================================
-local function FindTop()
-    local best   = nil
-    local bestY  = -math.huge
+local function FindFinishTarget()
+    local ign    = Char()
+    local bestDoor = nil
+    local bestY    = -math.huge
 
-    -- First pass: look for parts literally named "Finish"
+    -- Pass 1: named Door or Finish parts
+    local finishKW = {"door", "finish", "goal", "win", "end"}
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart") then
+        if obj:IsA("BasePart") and (not ign or not obj:IsDescendantOf(ign))
+        and InTowerWide(obj.Position) then
             local n = obj.Name:lower()
-            if (n == "finish" or n == "goal" or n == "win") and InTower(obj.Position) then
-                local sy = obj.Position.Y + obj.Size.Y / 2
-                if sy > bestY then bestY = sy best = obj end
+            for _, kw in ipairs(finishKW) do
+                if n == kw or n:find(kw) then
+                    if obj.Position.Y > bestY then
+                        bestY    = obj.Position.Y
+                        bestDoor = obj
+                    end
+                    break
+                end
             end
         end
     end
 
-    -- Second pass: highest floor part inside tower bounds
-    if not best then
+    -- Pass 2: highest Neon part above Y=50 (the door glows neon)
+    if not bestDoor then
         for _, obj in ipairs(workspace:GetDescendants()) do
-            if IsFloorPart(obj) then
-                local sy = obj.Position.Y + obj.Size.Y / 2
-                if sy > bestY then bestY = sy best = obj end
+            if obj:IsA("BasePart")
+            and (not ign or not obj:IsDescendantOf(ign))
+            and obj.Material == Enum.Material.Neon
+            and obj.Position.Y > 50
+            and InTowerWide(obj.Position) then
+                if obj.Position.Y > bestY then
+                    bestY    = obj.Position.Y
+                    bestDoor = obj
+                end
             end
         end
     end
 
-    return best
+    -- Pass 3: absolute highest floor candidate
+    if not bestDoor then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if IsFloorCandidate(obj, 4) then
+                local sy = obj.Position.Y + obj.Size.Y / 2
+                if sy > bestY then
+                    bestY    = sy
+                    bestDoor = obj
+                end
+            end
+        end
+    end
+
+    if not bestDoor then return nil end
+
+    -- Stand on the floor surface, centred on the part's X,Z
+    -- Offset slightly toward the world center so we land inside
+    -- the corridor entrance rather than on top of the door frame.
+    local sx = bestDoor.Position.X
+    local sz = bestDoor.Position.Z
+    -- Nudge toward center slightly (the corridor entrance)
+    local dx = TOH_CENTER_X - sx
+    local dz = TOH_CENTER_Z - sz
+    local mag = math.sqrt(dx*dx + dz*dz)
+    if mag > 0.1 then
+        sx = sx + (dx / mag) * 3
+        sz = sz + (dz / mag) * 3
+    end
+    local surfY = bestDoor.Position.Y + bestDoor.Size.Y / 2 + 3.5
+
+    return Vector3.new(sx, surfY, sz)
 end
 
 -- ============================================================
--- FIND NEXT SECTION FLOOR
--- Returns the floor of the nearest section above the player.
--- "Section floor" = a large (>=8x8) flat part, inside tower
--- bounds, at least 8 studs above current position.
--- To avoid picking tiny decorations, minimum size is strict.
+-- FIND NEXT SECTION PLATFORM
+-- Scans for the closest platform surface above the player.
+-- "Platform surface" = top face of a BasePart that is:
+--   - At least 4x4 in X and Z (small enough to catch narrow
+--     ToH platforms, but not tiny decorations)
+--   - Inside the wide tower bounds (300 studs radius)
+--   - At least 10 studs above the player's current Y
+--   - The LOWEST such surface found (exactly one level up)
+--
+-- The landing point is offset toward the player's horizontal
+-- facing direction so we land in roughly the right spot on
+-- that platform rather than its geometric centre (which might
+-- be a wall or empty space).
 -- ============================================================
-local function FindNextSection()
+local function FindNextPlatformTarget()
     local hrp = HRP()
     if not hrp then return nil end
+
     local currentY = hrp.Position.Y
     local best     = nil
-    local bestY    = math.huge
+    local bestSurf = math.huge   -- lowest surface above us
 
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if IsFloorPart(obj) and obj.Size.X >= 8 and obj.Size.Z >= 8 then
+        if IsFloorCandidate(obj, 4) then
             local surfTop = obj.Position.Y + obj.Size.Y / 2
-            -- Must be meaningfully above us (at least one body height above)
-            -- and the closest one so we skip exactly one section
-            if surfTop > currentY + 8 and surfTop < bestY then
-                bestY = surfTop
-                best  = obj
+            -- Must be at least 10 studs above us, pick the closest one
+            if surfTop > currentY + 10 and surfTop < bestSurf then
+                bestSurf = surfTop
+                best     = obj
             end
         end
     end
 
-    return best
+    if not best then return nil end
+
+    -- Land offset 3 studs toward player's facing direction
+    -- so we arrive near the edge of the platform, not floating
+    -- above empty air at the centre.
+    local fwd  = hrp.CFrame.LookVector
+    local flat = Vector3.new(fwd.X, 0, fwd.Z)
+    local dir  = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+
+    -- Clamp the offset so we stay on the platform
+    local halfX = best.Size.X / 2 - 2
+    local halfZ = best.Size.Z / 2 - 2
+    local ox    = math.max(-halfX, math.min(halfX, dir.X * 4))
+    local oz    = math.max(-halfZ, math.min(halfZ, dir.Z * 4))
+
+    local lx = best.Position.X + ox
+    local lz = best.Position.Z + oz
+    local ly = bestSurf + 3.5
+
+    return Vector3.new(lx, ly, lz)
 end
 
 -- ============================================================
@@ -821,9 +914,7 @@ local function RestoreForCoins()
 end
 
 -- ============================================================
--- 3-PHASE CLIMB (Rise -> Cross -> Land)
--- Speed: 5 studs per 0.1s = 50 studs/sec
--- Press button again to cancel mid-climb.
+-- 3-PHASE CLIMB (Rise -> Cross -> Land) - 50 studs/sec
 -- ============================================================
 local STEP  = 5
 local DELAY = 0.1
@@ -861,7 +952,7 @@ local function ClimbTo(targetPos, onDone)
             return
         end
 
-        local startPos = hrp.Position
+        local startPos    = hrp.Position
         local aboveStart  = Vector3.new(startPos.X,  targetPos.Y + 30, startPos.Z)
         local aboveTarget = Vector3.new(targetPos.X, targetPos.Y + 30, targetPos.Z)
 
@@ -891,37 +982,33 @@ local function ClimbTo(targetPos, onDone)
 end
 
 -- ============================================================
--- AUTO COMPLETE
+-- AUTO COMPLETE - climbs to the finish door/corridor
 -- ============================================================
 local function AutoComplete()
-    local top = FindTop()
-    if not top then
-        Notify("ch4rlies hub", "Couldn't find tower top!", 3)
+    local target = FindFinishTarget()
+    if not target then
+        Notify("ch4rlies hub", "Couldn't find finish area!", 3)
         return
     end
-    local surfY  = top.Position.Y + top.Size.Y / 2 + 3.5
-    local target = Vector3.new(top.Position.X, surfY, top.Position.Z)
-    Notify("ch4rlies hub", "Climbing to top... press again to cancel", 4)
+    Notify("ch4rlies hub", "Climbing to finish door... press again to cancel", 4)
     ClimbTo(target, function()
         RestoreForCoins()
-        Notify("ch4rlies hub", "Reached the top!", 4)
+        Notify("ch4rlies hub", "Reached the top! Coins awarded.", 4)
     end)
 end
 
 -- ============================================================
--- SKIP ONE SECTION
+-- SKIP ONE SECTION - climbs to next platform above player
 -- ============================================================
 local function SkipSection()
-    local next = FindNextSection()
-    if not next then
-        Notify("ch4rlies hub", "No next section found!", 3)
+    local target = FindNextPlatformTarget()
+    if not target then
+        Notify("ch4rlies hub", "No platform found above you!", 3)
         return
     end
-    local surfY  = next.Position.Y + next.Size.Y / 2 + 3.5
-    local target = Vector3.new(next.Position.X, surfY, next.Position.Z)
-    Notify("ch4rlies hub", "Skipping to next section...", 3)
+    Notify("ch4rlies hub", "Skipping to next platform...", 3)
     ClimbTo(target, function()
-        Notify("ch4rlies hub", "Landed on next section!", 2)
+        Notify("ch4rlies hub", "Landed on next platform!", 2)
     end)
 end
 
@@ -984,11 +1071,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v8.0",
+    LoadingSubtitle = "Tower of Hell  |  v8.1",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving = {Enabled = true, FileName = "ch4rlies_toh_v8"},
+    ConfigurationSaving = {Enabled = true, FileName = "ch4rlies_toh_v81"},
     KeySystem = false,
 })
 
@@ -1248,10 +1335,10 @@ TabM:CreateButton({
 })
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v8.0  |  Tower of Hell")
-TabM:CreateLabel("Motion-detect Freeze  |  Section Skip  |  Rainbow")
+TabM:CreateLabel("ch4rlies hub  |  v8.1  |  Tower of Hell")
+TabM:CreateLabel("Door Finder  |  Platform Skip  |  Full Freeze")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v8.0", "Fully rebuilt. Freeze and skip fixed!", 5)
+Notify("ch4rlies hub v8.1", "Freeze, door finder and platform skip fixed!", 5)
