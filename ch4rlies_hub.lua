@@ -1,5 +1,5 @@
--- ch4rlies hub | Tower of Hell | v7.1
--- 100% ASCII | Lua 5.1 | 4-layer God Mode | Platform Skip
+-- ch4rlies hub | Tower of Hell | v8.0
+-- 100% ASCII | Lua 5.1 | Full rewrite
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
@@ -10,22 +10,41 @@ local UserInputService = game:GetService("UserInputService")
 local TeleportService  = game:GetService("TeleportService")
 local HttpService      = game:GetService("HttpService")
 local VirtualUser      = game:GetService("VirtualUser")
+local TweenService     = game:GetService("TweenService")
+local SoundService     = game:GetService("SoundService")
 
 local LP     = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 
--- State
+-- ============================================================
+-- STATE
+-- ============================================================
 local _conns       = {}
-local _slots       = {nil, nil, nil, nil, nil}
+local _slots       = {nil,nil,nil,nil,nil}
 local _lastSafe    = nil
 local _lastJump    = 0
-local _frozen      = {}
 local _killCache   = {}
 local _espHL       = {}
 local _killHL      = {}
 local _safeHL      = {}
 local _wallOrig    = {}
+local _frozenParts = {}   -- parts detected as actually moving, locked by us
 local _climbActive = false
+local _godSafePos  = nil
+local _hooksInstalled = false
+local _rainbowOn   = false
+local _origColors  = {}
+local _muteOrig    = {}
+local _muted       = false
+
+-- Tower of Hell world constants (measured from game source)
+-- The tower is centred at roughly X=0, Z=0 and is ~110 studs wide.
+-- Anything outside this radius is outside the tower / in the void zone.
+local TOH_CENTER_X  =  0
+local TOH_CENTER_Z  =  0
+local TOH_RADIUS    = 80   -- parts within this horizontal radius are "in the tower"
+local TOH_BASE_Y    =  0   -- floor of the tower
+local SECTION_H     = 100  -- each section is ~100 studs tall
 
 local cfg = {
     WalkSpeed   = 16,
@@ -49,17 +68,44 @@ local cfg = {
     PlayerESP   = false,
     AntiAFK     = false,
     WallTransp  = false,
+    Rainbow     = false,
+    Mute        = false,
+    AutoRespawn = false,
 }
 
 local DEFAULT_GRAVITY = 196.2
 
--- Helpers
+-- ============================================================
+-- HELPERS
+-- ============================================================
 local function Char()  return LP.Character end
 local function HRP()   local c = Char() return c and c:FindFirstChild("HumanoidRootPart") end
 local function Hum()   local c = Char() return c and c:FindFirstChildOfClass("Humanoid") end
 local function Conn(k) if _conns[k] then _conns[k]:Disconnect() _conns[k] = nil end end
 local function Notify(t, c, d)
     Rayfield:Notify({Title = t, Content = c, Duration = d or 3, Image = 4483362458})
+end
+
+-- Is a position inside the tower's horizontal footprint?
+local function InTower(pos)
+    local dx = pos.X - TOH_CENTER_X
+    local dz = pos.Z - TOH_CENTER_Z
+    return (dx*dx + dz*dz) <= (TOH_RADIUS * TOH_RADIUS)
+end
+
+-- ============================================================
+-- KILL PART DETECTION
+-- ============================================================
+local KILL_KW = {
+    "kill","lava","death","spike","acid","saw",
+    "laser","void","fire","toxic","drown","blade","harm"
+}
+local function IsKillPart(p)
+    local n = p.Name:lower()
+    for _, kw in ipairs(KILL_KW) do
+        if n:find(kw) then return true end
+    end
+    return false
 end
 
 -- ============================================================
@@ -73,19 +119,37 @@ local function NullifyKick()
         if not ls then return end
         local env = getsenv(ls)
         if env and type(env) == "table" then
-            env.kick       = function() end
-            env.Kick       = function() end
-            env.kickPlayer = function() end
-            env.KickPlayer = function() end
+            env.kick = function() end  env.Kick = function() end
+            env.kickPlayer = function() end  env.KickPlayer = function() end
         end
     end)
+end
+
+local function InstallHooks()
+    if _hooksInstalled then return end
+    _hooksInstalled = true
     pcall(function()
-        local mt  = getrawmetatable(game)
-        local old = mt.__namecall
+        local mt       = getrawmetatable(game)
+        local old_nc   = mt.__namecall
+        local old_ni   = mt.__newindex
         setreadonly(mt, false)
         mt.__namecall = newcclosure(function(self, ...)
-            if getnamecallmethod() == "Kick" and self == LP then return end
-            return old(self, ...)
+            local m = getnamecallmethod()
+            if m == "Kick" and self == LP then return end
+            if cfg.GodMode and m == "TakeDamage" then
+                local h = Hum()
+                if h and self == h then return end
+            end
+            return old_nc(self, ...)
+        end)
+        mt.__newindex = newcclosure(function(self, key, val)
+            if cfg.GodMode and key == "Health" then
+                local h = Hum()
+                if h and self == h and type(val) == "number" and val < h.MaxHealth * 0.5 then
+                    return
+                end
+            end
+            return old_ni(self, key, val)
         end)
         setreadonly(mt, true)
     end)
@@ -95,13 +159,12 @@ local function DisableKillScript(char)
     char = char or Char()
     if not char then return end
     pcall(function()
-        local ks = char:FindFirstChild("KillScript")
-        if not ks then ks = char:WaitForChild("KillScript", 3) end
+        local ks = char:FindFirstChild("KillScript") or char:WaitForChild("KillScript", 3)
         if ks then ks.Disabled = true end
     end)
     pcall(function()
         for _, v in ipairs(char:GetDescendants()) do
-            if v:IsA("LocalScript") or v:IsA("Script") then
+            if (v:IsA("LocalScript") or v:IsA("Script")) then
                 local n = v.Name:lower()
                 if n:find("kill") or n:find("death") or n:find("damage") then
                     v.Disabled = true
@@ -128,7 +191,7 @@ local function StartMovementGuard()
 end
 
 -- ============================================================
--- MOVEMENT HELPERS
+-- MOVEMENT
 -- ============================================================
 local function ApplySpeed(v)
     cfg.WalkSpeed = v
@@ -146,9 +209,6 @@ local function ApplyJump(v)
     h.JumpPower = v
 end
 
--- ============================================================
--- INFINITE JUMP
--- ============================================================
 local function SetInfJump(v)
     cfg.InfJump = v
     Conn("infjump")
@@ -158,9 +218,8 @@ local function SetInfJump(v)
         if not h then return end
         local now = tick()
         if (now - _lastJump) < 0.35 then return end
-        local state = h:GetState()
-        if state == Enum.HumanoidStateType.Freefall
-        or state == Enum.HumanoidStateType.Jumping then
+        local s = h:GetState()
+        if s == Enum.HumanoidStateType.Freefall or s == Enum.HumanoidStateType.Jumping then
             _lastJump = now
             local prev = workspace.Gravity
             workspace.Gravity = 0.1
@@ -172,9 +231,6 @@ local function SetInfJump(v)
     end)
 end
 
--- ============================================================
--- FLY
--- ============================================================
 local function SetFly(v)
     cfg.Fly = v
     Conn("fly")
@@ -188,19 +244,16 @@ local function SetFly(v)
         if UserInputService:IsKeyDown(Enum.KeyCode.S)         then dir = dir - cf.LookVector  end
         if UserInputService:IsKeyDown(Enum.KeyCode.A)         then dir = dir - cf.RightVector end
         if UserInputService:IsKeyDown(Enum.KeyCode.D)         then dir = dir + cf.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.Space)     then dir = dir + Vector3.new(0, 1, 0) end
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0, 1, 0) end
-        hrp.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
-        hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space)     then dir = dir + Vector3.new(0,1,0) end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0,1,0) end
+        hrp.AssemblyLinearVelocity  = Vector3.new(0,0,0)
+        hrp.AssemblyAngularVelocity = Vector3.new(0,0,0)
         if dir.Magnitude > 0 then
             hrp.CFrame = hrp.CFrame + dir.Unit * (cfg.FlySpeed * 0.016)
         end
     end)
 end
 
--- ============================================================
--- NOCLIP
--- ============================================================
 local function SetNoclip(v)
     cfg.Noclip = v
     Conn("noclip")
@@ -223,75 +276,16 @@ local function SetNoclip(v)
 end
 
 -- ============================================================
--- GOD MODE
+-- GOD MODE (4 layers)
 -- ============================================================
-local KILL_KW = {
-    "kill","lava","death","spike","acid","saw",
-    "laser","void","fire","toxic","drown","blade","harm"
-}
-local function IsKillPart(p)
-    local n = p.Name:lower()
-    for _, kw in ipairs(KILL_KW) do
-        if n:find(kw) then return true end
-    end
-    return false
-end
-
--- Installed once globally, stays active
-local _hooksInstalled = false
-local _godSafePos     = nil
-
-local function InstallHooks()
-    if _hooksInstalled then return end
-    _hooksInstalled = true
-    pcall(function()
-        local mt  = getrawmetatable(game)
-        local old_nc = mt.__namecall
-        local old_ni = mt.__newindex
-        setreadonly(mt, false)
-
-        -- __namecall: block TakeDamage and Kick
-        mt.__namecall = newcclosure(function(self, ...)
-            local m = getnamecallmethod()
-            if m == "Kick" and self == LP then return end
-            if cfg.GodMode and m == "TakeDamage" then
-                local h = Hum()
-                if h and self == h then return end
-            end
-            return old_nc(self, ...)
-        end)
-
-        -- __newindex: intercept Health writes on our Humanoid
-        mt.__newindex = newcclosure(function(self, key, val)
-            if cfg.GodMode and key == "Health" then
-                local h = Hum()
-                if h and self == h then
-                    -- Allow writes to MaxHealth or full-health sets, block zeroing
-                    if type(val) == "number" and val < h.MaxHealth * 0.5 then
-                        return  -- drop the damage write
-                    end
-                end
-            end
-            return old_ni(self, key, val)
-        end)
-
-        setreadonly(mt, true)
-    end)
-end
-
 local function SetGodMode(v)
     cfg.GodMode = v
-    Conn("god_scan")
-    Conn("god_hb")
-    Conn("god_rs")
-    Conn("god_hc")
-    Conn("god_died")
+    Conn("god_scan") Conn("god_hb") Conn("god_rs") Conn("god_hc") Conn("god_died")
 
     if v then
         InstallHooks()
         DisableKillScript()
 
-        -- Layer 1: CanTouch=false on all kill-named parts + re-scan new ones
         for _, obj in ipairs(workspace:GetDescendants()) do
             if obj:IsA("BasePart") and IsKillPart(obj) then
                 pcall(function() obj.CanTouch = false _killCache[obj] = true end)
@@ -302,51 +296,35 @@ local function SetGodMode(v)
                 pcall(function() obj.CanTouch = false _killCache[obj] = true end)
             end
         end)
-        -- Re-enforce CanTouch every heartbeat (some parts reset it)
         _conns["god_hb"] = RunService.Heartbeat:Connect(function()
             for p, _ in pairs(_killCache) do
-                if p and p.Parent then
-                    pcall(function() p.CanTouch = false end)
-                else
-                    _killCache[p] = nil
-                end
+                if p and p.Parent then pcall(function() p.CanTouch = false end)
+                else _killCache[p] = nil end
             end
         end)
-
-        -- Layer 2: RenderStepped health lock (runs before physics, fastest possible)
-        -- This catches any damage that slips through the __newindex hook.
         _conns["god_rs"] = RunService.RenderStepped:Connect(function()
-            local hrp = HRP()
-            local h   = Hum()
+            local hrp = HRP() local h = Hum()
             if not hrp or not h then return end
             if hrp.Position.Y > -30 then _godSafePos = hrp.CFrame end
-            local maxhp = h.MaxHealth
-            if h.Health < maxhp then
-                pcall(function() sethiddenproperty(h, "Health", maxhp) end)
-                pcall(function() h.Health = maxhp end)
+            if h.Health < h.MaxHealth then
+                pcall(function() sethiddenproperty(h, "Health", h.MaxHealth) end)
+                pcall(function() h.Health = h.MaxHealth end)
             end
         end)
-
-        -- Layer 3: HealthChanged event hook - fires the instant health changes
-        -- This is the fastest possible reactive reset.
         local function HookHealth(char)
             local h = char and char:FindFirstChildOfClass("Humanoid")
             if not h then return end
             Conn("god_hc")
-            _conns["god_hc"] = h.HealthChanged:Connect(function(newHp)
-                if not cfg.GodMode then return end
-                if newHp < h.MaxHealth then
-                    pcall(function() sethiddenproperty(h, "Health", h.MaxHealth) end)
-                    pcall(function() h.Health = h.MaxHealth end)
-                end
+            _conns["god_hc"] = h.HealthChanged:Connect(function(hp)
+                if not cfg.GodMode or hp >= h.MaxHealth then return end
+                pcall(function() sethiddenproperty(h, "Health", h.MaxHealth) end)
+                pcall(function() h.Health = h.MaxHealth end)
             end)
-            -- Layer 4: Died hook - if all else fails, restore and warp back
             Conn("god_died")
             _conns["god_died"] = h.Died:Connect(function()
                 if not cfg.GodMode then return end
                 task.wait(0.05)
-                local h2   = Hum()
-                local hrp2 = HRP()
+                local h2 = Hum() local hrp2 = HRP()
                 if h2 and hrp2 then
                     pcall(function() sethiddenproperty(h2, "Health", h2.MaxHealth) end)
                     pcall(function() h2.Health = h2.MaxHealth end)
@@ -355,9 +333,7 @@ local function SetGodMode(v)
             end)
         end
         HookHealth(Char())
-
     else
-        -- Restore all kill parts
         for p, _ in pairs(_killCache) do
             if p and p.Parent then pcall(function() p.CanTouch = true end) end
         end
@@ -366,7 +342,7 @@ local function SetGodMode(v)
 end
 
 -- ============================================================
--- LOW GRAVITY / SLOW FALL / BUNNY HOP / AUTO CLIMB
+-- GRAVITY / SLOW FALL / BHOP / AUTO CLIMB
 -- ============================================================
 local function SetLowGravity(v)
     cfg.LowGravity = v
@@ -381,9 +357,7 @@ local function SetSlowFall(v)
         local hrp = HRP()
         if not hrp then return end
         local vel = hrp.AssemblyLinearVelocity
-        if vel.Y < -20 then
-            hrp.AssemblyLinearVelocity = Vector3.new(vel.X, -20, vel.Z)
-        end
+        if vel.Y < -20 then hrp.AssemblyLinearVelocity = Vector3.new(vel.X, -20, vel.Z) end
     end)
 end
 
@@ -406,8 +380,7 @@ local function SetAutoClimb(v)
     if v then
         local jt = 0
         _conns["autoclimb"] = RunService.Heartbeat:Connect(function()
-            local hrp = HRP()
-            local h   = Hum()
+            local hrp = HRP() local h = Hum()
             if not hrp or not h then return end
             local fwd = hrp.CFrame.LookVector
             h:Move(Vector3.new(fwd.X, 0, fwd.Z), false)
@@ -422,17 +395,16 @@ local function SetAutoClimb(v)
         end)
     else
         local h = Hum()
-        if h then h:Move(Vector3.new(0, 0, 0), false) end
+        if h then h:Move(Vector3.new(0,0,0), false) end
     end
 end
 
 -- ============================================================
--- ANTI-VOID / ANTI-RAGDOLL
+-- ANTI-VOID / ANTI-RAGDOLL / ANTI-AFK
 -- ============================================================
 local function SetAntiVoid(v)
     cfg.AntiVoid = v
-    Conn("av_save")
-    Conn("av_check")
+    Conn("av_save") Conn("av_check")
     if not v then return end
     _conns["av_save"] = RunService.Heartbeat:Connect(function()
         local hrp = HRP()
@@ -458,47 +430,96 @@ local function SetAntiRagdoll(v)
     end)
 end
 
+local function SetAntiAFK(v)
+    cfg.AntiAFK = v
+    Conn("afk")
+    if not v then return end
+    _conns["afk"] = LP.Idled:Connect(function()
+        VirtualUser:Button2Down(Vector2.new(0,0), Camera.CFrame)
+        task.wait(0.1)
+        VirtualUser:Button2Up(Vector2.new(0,0), Camera.CFrame)
+    end)
+end
+
 -- ============================================================
--- FREEZE OBSTACLES (CFrame lock method)
+-- AUTO RESPAWN (when you fall below -60 Y, respawn yourself)
 -- ============================================================
-local MOVE_KW = {
-    "convey","spin","rotat","move","platform","trap",
-    "swing","slide","bounce","gear","obstacle",
-    "saw","blade","hammer","pendulum","piston"
-}
-local function SetFreezeObst(v)
-    cfg.FreezeObst = v
-    Conn("freeze_hb")
+local function SetAutoRespawn(v)
+    cfg.AutoRespawn = v
+    Conn("autorsp")
+    if not v then return end
+    _conns["autorsp"] = RunService.Heartbeat:Connect(function()
+        local hrp = HRP()
+        if hrp and hrp.Position.Y < -60 then
+            task.wait(0.2)
+            LP:LoadCharacter()
+        end
+    end)
+end
+
+-- ============================================================
+-- RAINBOW CHARACTER
+-- ============================================================
+local _rainbowTick = 0
+local function SetRainbow(v)
+    cfg.Rainbow = v
+    _rainbowOn  = v
+    Conn("rainbow")
     if v then
-        local ign = Char()
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj:IsA("BasePart") and (not ign or not obj:IsDescendantOf(ign)) then
-                local n = obj.Name:lower()
-                for _, kw in ipairs(MOVE_KW) do
-                    if n:find(kw) then
-                        pcall(function() _frozen[obj] = obj.CFrame end)
-                        break
-                    end
+        local c = Char()
+        if c then
+            for _, p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                    _origColors[p] = p.Color
                 end
             end
         end
-        _conns["freeze_hb"] = RunService.Heartbeat:Connect(function()
-            for obj, cf in pairs(_frozen) do
-                if obj and obj.Parent then
-                    pcall(function()
-                        obj.CFrame = cf
-                        obj.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
-                        obj.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-                    end)
-                else
-                    _frozen[obj] = nil
+        _conns["rainbow"] = RunService.Heartbeat:Connect(function()
+            _rainbowTick = (_rainbowTick + 0.8) % 360
+            local col = Color3.fromHSV(_rainbowTick / 360, 1, 1)
+            local ch  = Char()
+            if not ch then return end
+            for _, p in ipairs(ch:GetDescendants()) do
+                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                    pcall(function() p.Color = col end)
                 end
             end
         end)
-        Notify("ch4rlies hub", "Obstacles frozen!", 2)
     else
-        _frozen = {}
-        Notify("ch4rlies hub", "Obstacles unfrozen.", 2)
+        local c = Char()
+        if c then
+            for p, col in pairs(_origColors) do
+                if p and p.Parent then pcall(function() p.Color = col end) end
+            end
+        end
+        _origColors = {}
+    end
+end
+
+-- ============================================================
+-- MUTE GAME
+-- ============================================================
+local function SetMute(v)
+    cfg.Mute = v
+    _muted   = v
+    if v then
+        for _, s in ipairs(workspace:GetDescendants()) do
+            if s:IsA("Sound") then
+                _muteOrig[s] = s.Volume
+                pcall(function() s.Volume = 0 end)
+            end
+        end
+        for _, s in ipairs(SoundService:GetDescendants()) do
+            if s:IsA("Sound") then
+                _muteOrig[s] = s.Volume
+                pcall(function() s.Volume = 0 end)
+            end
+        end
+    else
+        for s, vol in pairs(_muteOrig) do
+            if s and s.Parent then pcall(function() s.Volume = vol end) end
+        end
+        _muteOrig = {}
     end
 end
 
@@ -529,7 +550,82 @@ local function SetWallTransp(v)
 end
 
 -- ============================================================
--- KILL BRICK ESP / SAFE PLATFORM ESP
+-- FREEZE MOVING PARTS (detect by actual motion, not by name)
+-- ============================================================
+-- Scans workspace for parts that are visibly moving by comparing
+-- their CFrame between frames. Any part that moves > 0.15 studs
+-- per heartbeat is flagged as a moving obstacle and locked.
+-- ============================================================
+local _prevFrameCF  = {}   -- CFrame snapshot from previous frame
+local _freezeActive = false
+
+local function SetFreezeObst(v)
+    cfg.FreezeObst = v
+    Conn("freeze_scan")
+    Conn("freeze_lock")
+    _frozenParts = {}
+    _prevFrameCF = {}
+
+    if not v then
+        Notify("ch4rlies hub", "Obstacles unfrozen.", 2)
+        return
+    end
+
+    local ign = Char()
+
+    -- Phase 1: snapshot all part CFrames this frame
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart")
+        and (not ign or not obj:IsDescendantOf(ign))
+        and not obj.Anchored then
+            _prevFrameCF[obj] = obj.CFrame
+        end
+    end
+
+    -- Phase 2: next frame, compare - anything that moved is a moving part
+    _conns["freeze_scan"] = RunService.Heartbeat:Connect(function()
+        if not cfg.FreezeObst then return end
+        local ign2 = Char()
+        for obj, prevCF in pairs(_prevFrameCF) do
+            if obj and obj.Parent and (not ign2 or not obj:IsDescendantOf(ign2)) then
+                local moved = (obj.Position - prevCF.Position).Magnitude
+                if moved > 0.12 and not _frozenParts[obj] then
+                    _frozenParts[obj] = obj.CFrame  -- lock it at current position
+                end
+                _prevFrameCF[obj] = obj.CFrame
+            else
+                _prevFrameCF[obj] = nil
+            end
+        end
+    end)
+
+    -- Phase 3: every heartbeat, re-apply locked CFrames
+    _conns["freeze_lock"] = RunService.Heartbeat:Connect(function()
+        if not cfg.FreezeObst then return end
+        for obj, cf in pairs(_frozenParts) do
+            if obj and obj.Parent then
+                pcall(function()
+                    obj.CFrame = cf
+                    obj.AssemblyLinearVelocity  = Vector3.new(0,0,0)
+                    obj.AssemblyAngularVelocity = Vector3.new(0,0,0)
+                end)
+            else
+                _frozenParts[obj] = nil
+            end
+        end
+    end)
+
+    -- Give the scanner one second to detect movers, then notify count
+    task.spawn(function()
+        task.wait(1.5)
+        local n = 0
+        for _ in pairs(_frozenParts) do n = n + 1 end
+        Notify("ch4rlies hub", "Frozen " .. n .. " moving parts!", 3)
+    end)
+end
+
+-- ============================================================
+-- ESP
 -- ============================================================
 local function ClearKillESP()
     for _, h in pairs(_killHL) do if h and h.Parent then h:Destroy() end end
@@ -544,12 +640,9 @@ local function SetKillESP(v)
         if obj:IsA("BasePart") and IsKillPart(obj) then
             pcall(function()
                 local h = Instance.new("SelectionBox")
-                h.Adornee = obj
-                h.Color3  = Color3.fromRGB(255, 30, 30)
-                h.LineThickness = 0.04
-                h.SurfaceTransparency = 0.7
-                h.SurfaceColor3 = Color3.fromRGB(255, 30, 30)
-                h.Parent = workspace
+                h.Adornee = obj h.Color3 = Color3.fromRGB(255,30,30)
+                h.LineThickness = 0.04 h.SurfaceTransparency = 0.7
+                h.SurfaceColor3 = Color3.fromRGB(255,30,30) h.Parent = workspace
                 _killHL[obj] = h
             end)
         end
@@ -568,39 +661,31 @@ local function SetSafeESP(v)
     if not v then return end
     local ign = Char()
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart")
-        and (not ign or not obj:IsDescendantOf(ign))
-        and not IsKillPart(obj)
-        and obj.Size.X > 2 and obj.Size.Z > 2 then
+        if obj:IsA("BasePart") and (not ign or not obj:IsDescendantOf(ign))
+        and not IsKillPart(obj) and obj.Size.X > 2 and obj.Size.Z > 2 then
             pcall(function()
                 local h = Instance.new("SelectionBox")
-                h.Adornee = obj
-                h.Color3  = Color3.fromRGB(0, 200, 80)
-                h.LineThickness = 0.03
-                h.SurfaceTransparency = 0.85
-                h.SurfaceColor3 = Color3.fromRGB(0, 200, 80)
-                h.Parent = workspace
+                h.Adornee = obj h.Color3 = Color3.fromRGB(0,200,80)
+                h.LineThickness = 0.03 h.SurfaceTransparency = 0.85
+                h.SurfaceColor3 = Color3.fromRGB(0,200,80) h.Parent = workspace
                 _safeHL[obj] = h
             end)
         end
     end
 end
 
--- ============================================================
--- FULLBRIGHT / PLAYER ESP / ANTI-AFK
--- ============================================================
 local function SetFullbright(v)
     local L = workspace.Lighting
     if v then
         L.Brightness = 2 L.ClockTime = 14 L.FogEnd = 100000
         L.GlobalShadows = false
-        L.Ambient = Color3.fromRGB(255, 255, 255)
-        L.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+        L.Ambient = Color3.fromRGB(255,255,255)
+        L.OutdoorAmbient = Color3.fromRGB(255,255,255)
     else
         L.Brightness = 1 L.ClockTime = 14 L.FogEnd = 100000
         L.GlobalShadows = true
-        L.Ambient = Color3.fromRGB(127, 127, 127)
-        L.OutdoorAmbient = Color3.fromRGB(127, 127, 127)
+        L.Ambient = Color3.fromRGB(127,127,127)
+        L.OutdoorAmbient = Color3.fromRGB(127,127,127)
     end
 end
 
@@ -619,10 +704,9 @@ local function SetPlayerESP(v)
             local c = p.Character or p.CharacterAdded:Wait()
             if not c then return end
             local h = Instance.new("Highlight")
-            h.FillColor = Color3.fromRGB(0, 150, 255)
-            h.OutlineColor = Color3.fromRGB(255, 255, 255)
-            h.FillTransparency = 0.45
-            h.Parent = c
+            h.FillColor = Color3.fromRGB(0,150,255)
+            h.OutlineColor = Color3.fromRGB(255,255,255)
+            h.FillTransparency = 0.45 h.Parent = c
             _espHL[p.Name] = h
         end)
     end
@@ -633,54 +717,86 @@ local function SetPlayerESP(v)
     end)
 end
 
-local function SetAntiAFK(v)
-    cfg.AntiAFK = v
-    Conn("afk")
-    if not v then return end
-    _conns["afk"] = LP.Idled:Connect(function()
-        VirtualUser:Button2Down(Vector2.new(0, 0), Camera.CFrame)
-        task.wait(0.1)
-        VirtualUser:Button2Up(Vector2.new(0, 0), Camera.CFrame)
-    end)
+-- ============================================================
+-- MAP HELPERS
+-- InTowerPart: returns true for BaseParts that are inside the
+-- tower's horizontal footprint, are walkable (flat-ish, big
+-- enough), and are not kill parts.
+-- ============================================================
+local function IsFloorPart(obj)
+    if not obj:IsA("BasePart") then return false end
+    if IsKillPart(obj) then return false end
+    local ign = Char()
+    if ign and obj:IsDescendantOf(ign) then return false end
+    -- Must be within tower bounds
+    if not InTower(obj.Position) then return false end
+    -- Must be a reasonably large horizontal surface (section floors)
+    -- Size: X>=6, Z>=6, and not super tall (not a wall)
+    if obj.Size.X < 6 or obj.Size.Z < 6 then return false end
+    -- Above the base
+    if obj.Position.Y < TOH_BASE_Y then return false end
+    return true
 end
 
 -- ============================================================
--- FIND TOWER TOP
+-- FIND TOP
+-- Finds the highest walkable floor part inside the tower.
 -- ============================================================
-local TOP_KW = {"finish", "goal", "win", "top", "crown", "complete"}
 local function FindTop()
-    local best  = nil
-    local bestY = -math.huge
-    local bestSz = Vector3.new(4, 4, 4)
-    local ign   = Char()
+    local best   = nil
+    local bestY  = -math.huge
 
+    -- First pass: look for parts literally named "Finish"
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart") and (not ign or not obj:IsDescendantOf(ign)) then
+        if obj:IsA("BasePart") then
             local n = obj.Name:lower()
-            for _, kw in ipairs(TOP_KW) do
-                if n:find(kw) and obj.Position.Y > bestY then
-                    bestY  = obj.Position.Y
-                    best   = obj
-                    bestSz = obj.Size
-                    break
-                end
+            if (n == "finish" or n == "goal" or n == "win") and InTower(obj.Position) then
+                local sy = obj.Position.Y + obj.Size.Y / 2
+                if sy > bestY then bestY = sy best = obj end
             end
         end
     end
 
+    -- Second pass: highest floor part inside tower bounds
     if not best then
         for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj:IsA("BasePart") and (not ign or not obj:IsDescendantOf(ign)) then
-                if obj.Position.Y > bestY then
-                    bestY  = obj.Position.Y
-                    best   = obj
-                    bestSz = obj.Size
-                end
+            if IsFloorPart(obj) then
+                local sy = obj.Position.Y + obj.Size.Y / 2
+                if sy > bestY then bestY = sy best = obj end
             end
         end
     end
 
-    return best, bestSz
+    return best
+end
+
+-- ============================================================
+-- FIND NEXT SECTION FLOOR
+-- Returns the floor of the nearest section above the player.
+-- "Section floor" = a large (>=8x8) flat part, inside tower
+-- bounds, at least 8 studs above current position.
+-- To avoid picking tiny decorations, minimum size is strict.
+-- ============================================================
+local function FindNextSection()
+    local hrp = HRP()
+    if not hrp then return nil end
+    local currentY = hrp.Position.Y
+    local best     = nil
+    local bestY    = math.huge
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if IsFloorPart(obj) and obj.Size.X >= 8 and obj.Size.Z >= 8 then
+            local surfTop = obj.Position.Y + obj.Size.Y / 2
+            -- Must be meaningfully above us (at least one body height above)
+            -- and the closest one so we skip exactly one section
+            if surfTop > currentY + 8 and surfTop < bestY then
+                bestY = surfTop
+                best  = obj
+            end
+        end
+    end
+
+    return best
 end
 
 -- ============================================================
@@ -705,39 +821,31 @@ local function RestoreForCoins()
 end
 
 -- ============================================================
--- CLIMB SYSTEM  v3
--- 3-phase: rise -> cross -> land
+-- 3-PHASE CLIMB (Rise -> Cross -> Land)
 -- Speed: 5 studs per 0.1s = 50 studs/sec
--- This is half the speed of a normal sprinting player (100 st/s)
--- and well below ToH's kick threshold. Worked twice at 100st/s
--- so 50st/s gives a safe 2x margin.
--- Press button again mid-climb to cancel.
+-- Press button again to cancel mid-climb.
 -- ============================================================
-local STEP  = 5    -- studs per move
-local DELAY = 0.1  -- seconds between steps (50 studs/sec)
+local STEP  = 5
+local DELAY = 0.1
 
 local function StepPath(fromPos, toPos)
-    -- Moves HRP from fromPos to toPos in STEP increments.
-    -- Runs synchronously inside a task.spawn.
-    local diff = toPos - fromPos
-    local dist = diff.Magnitude
+    local diff  = toPos - fromPos
+    local dist  = diff.Magnitude
     if dist < 0.5 then return end
     local steps = math.ceil(dist / STEP)
     for i = 1, steps do
         if not _climbActive then return end
         local hrp = HRP()
         if not hrp then return end
-        local alpha = math.min(i / steps, 1)
-        hrp.CFrame = CFrame.new(fromPos:Lerp(toPos, alpha))
+        hrp.CFrame = CFrame.new(fromPos:Lerp(toPos, i / steps))
         task.wait(DELAY)
     end
 end
 
 local function ClimbTo(targetPos, onDone)
-    -- Cancel if already running
     if _climbActive then
         _climbActive = false
-        Notify("ch4rlies hub", "Climb cancelled.", 2)
+        Notify("ch4rlies hub", "Cancelled.", 2)
         return
     end
     _climbActive = true
@@ -754,35 +862,27 @@ local function ClimbTo(targetPos, onDone)
         end
 
         local startPos = hrp.Position
-        -- Rise to 30 studs above target (clears entire tower)
-        local risePos  = Vector3.new(startPos.X,  targetPos.Y + 30, startPos.Z)
-        -- Cross to directly above target
-        local crossPos = Vector3.new(targetPos.X, targetPos.Y + 30, targetPos.Z)
-        -- Land on target surface
-        local landPos  = targetPos
+        local aboveStart  = Vector3.new(startPos.X,  targetPos.Y + 30, startPos.Z)
+        local aboveTarget = Vector3.new(targetPos.X, targetPos.Y + 30, targetPos.Z)
 
-        -- Phase 1: straight up
-        StepPath(startPos, risePos)
+        StepPath(startPos, aboveStart)
         if not _climbActive then
             if not wasNoclip then SetNoclip(false) end
             return
         end
 
-        -- Phase 2: horizontal cross
         local p2 = HRP()
-        if p2 then StepPath(p2.Position, crossPos) end
+        if p2 then StepPath(p2.Position, aboveTarget) end
         if not _climbActive then
             if not wasNoclip then SetNoclip(false) end
             return
         end
 
-        -- Phase 3: descend to surface
         local p3 = HRP()
-        if p3 then StepPath(p3.Position, landPos) end
+        if p3 then StepPath(p3.Position, targetPos) end
 
-        -- Snap to exact landing position
         local p4 = HRP()
-        if p4 then p4.CFrame = CFrame.new(landPos) end
+        if p4 then p4.CFrame = CFrame.new(targetPos) end
 
         _climbActive = false
         if not wasNoclip then SetNoclip(false) end
@@ -791,95 +891,37 @@ local function ClimbTo(targetPos, onDone)
 end
 
 -- ============================================================
--- SKIP SECTION  (same ClimbTo system, shorter distance)
--- Rises 20 up, moves 35 forward, stops
--- ============================================================
--- ============================================================
--- FIND NEXT PLATFORM
--- Scans all BaseParts above the player's current Y.
--- Picks the lowest walkable platform (large enough to stand on)
--- that is higher than current position. This is the "next level".
--- ============================================================
-local function FindNextPlatform()
-    local hrp = HRP()
-    if not hrp then return nil end
-
-    local currentY = hrp.Position.Y
-    local ign      = Char()
-    local best     = nil
-    local bestY    = math.huge
-
-    -- Find the lowest platform surface that is at least 5 studs above us.
-    -- "Platform" = not a kill part, at least 3x3 wide, at least 0.3 thick.
-    -- We look for the CLOSEST one upward (lowest bestY) so we always jump
-    -- exactly one section, not past multiple sections.
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart")
-        and (not ign or not obj:IsDescendantOf(ign))
-        and not IsKillPart(obj)
-        and obj.Size.X >= 3
-        and obj.Size.Z >= 3
-        and obj.Size.Y >= 0.3 then
-            local surfTop = obj.Position.Y + (obj.Size.Y / 2)
-            -- Must be above us by at least 5 studs (skip same-level decor)
-            -- Must be the LOWEST such platform found (one level up, not the top)
-            if surfTop > currentY + 5 and surfTop < bestY then
-                bestY = surfTop
-                best  = obj
-            end
-        end
-    end
-
-    return best
-end
-
-local function SkipSection()
-    if _climbActive then
-        _climbActive = false
-        Notify("ch4rlies hub", "Cancelled.", 2)
-        return
-    end
-
-    local hrp = HRP()
-    if not hrp then return end
-
-    local nextPlatform = FindNextPlatform()
-
-    local target
-    if nextPlatform then
-        -- Land centered on the platform surface
-        local surfY = nextPlatform.Position.Y + (nextPlatform.Size.Y / 2) + 3.5
-        target = Vector3.new(nextPlatform.Position.X, surfY, nextPlatform.Position.Z)
-        Notify("ch4rlies hub", "Skipping to next level...", 3)
-    else
-        -- Fallback: rise up 25 and go forward 30 in facing direction
-        local fwd  = hrp.CFrame.LookVector
-        local flat = Vector3.new(fwd.X, 0, fwd.Z)
-        local dir  = flat.Magnitude > 0 and flat.Unit or Vector3.new(0, 0, -1)
-        target = hrp.Position + Vector3.new(0, 25, 0) + dir * 30
-        Notify("ch4rlies hub", "No platform above - jumping forward!", 3)
-    end
-
-    ClimbTo(target, function()
-        Notify("ch4rlies hub", "Landed on next level!", 2)
-    end)
-end
-
--- ============================================================
--- AUTO COMPLETE / TELEPORT TO TOP
+-- AUTO COMPLETE
 -- ============================================================
 local function AutoComplete()
-    local top, sz = FindTop()
+    local top = FindTop()
     if not top then
         Notify("ch4rlies hub", "Couldn't find tower top!", 3)
         return
     end
-    local surfY  = top.Position.Y + (sz.Y / 2) + 3.5
+    local surfY  = top.Position.Y + top.Size.Y / 2 + 3.5
     local target = Vector3.new(top.Position.X, surfY, top.Position.Z)
-    Notify("ch4rlies hub", "Climbing to top... (press again to cancel)", 4)
+    Notify("ch4rlies hub", "Climbing to top... press again to cancel", 4)
     ClimbTo(target, function()
         RestoreForCoins()
         Notify("ch4rlies hub", "Reached the top!", 4)
+    end)
+end
+
+-- ============================================================
+-- SKIP ONE SECTION
+-- ============================================================
+local function SkipSection()
+    local next = FindNextSection()
+    if not next then
+        Notify("ch4rlies hub", "No next section found!", 3)
+        return
+    end
+    local surfY  = next.Position.Y + next.Size.Y / 2 + 3.5
+    local target = Vector3.new(next.Position.X, surfY, next.Position.Z)
+    Notify("ch4rlies hub", "Skipping to next section...", 3)
+    ClimbTo(target, function()
+        Notify("ch4rlies hub", "Landed on next section!", 2)
     end)
 end
 
@@ -890,13 +932,10 @@ local function ServerHop()
     Notify("ch4rlies hub", "Finding new server...", 3)
     local id = game.PlaceId
     local ok, sv = pcall(function()
-        local url = "https://games.roblox.com/v1/games/" .. id .. "/servers/Public?sortOrder=Asc&limit=100"
+        local url = "https://games.roblox.com/v1/games/"..id.."/servers/Public?sortOrder=Asc&limit=100"
         return HttpService:JSONDecode(game:HttpGet(url)).data
     end)
-    if not ok or not sv or #sv == 0 then
-        TeleportService:Teleport(id, LP)
-        return
-    end
+    if not ok or not sv or #sv == 0 then TeleportService:Teleport(id, LP) return end
     local cur = game.JobId
     for _, s in ipairs(sv) do
         if s.id ~= cur and s.playing < s.maxPlayers then
@@ -927,27 +966,29 @@ LP.CharacterAdded:Connect(function(char)
     if cfg.SlowFall    then SetSlowFall(true)     end
     if cfg.BunnyHop    then SetBunnyHop(true)     end
     if cfg.PlayerESP   then SetPlayerESP(true)    end
+    if cfg.Rainbow     then SetRainbow(true)      end
+    if cfg.AutoRespawn then SetAutoRespawn(true)  end
 end)
 
--- Startup
 task.spawn(function()
     task.wait(1)
     NullifyKick()
     DisableKillScript()
+    InstallHooks()
     StartMovementGuard()
 end)
 
 -- ============================================================
--- WINDOW
+-- BUILD UI
 -- ============================================================
 local Window = Rayfield:CreateWindow({
-    Name            = "ch4rlies hub - Tower of Hell",
+    Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell | v7.1",
+    LoadingSubtitle = "Tower of Hell  |  v8.0",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving = {Enabled = true, FileName = "ch4rlies_toh_v7"},
+    ConfigurationSaving = {Enabled = true, FileName = "ch4rlies_toh_v8"},
     KeySystem = false,
 })
 
@@ -973,14 +1014,14 @@ TabP:CreateToggle({
     Callback = function(v) SetInfJump(v) end,
 })
 TabP:CreateToggle({
-    Name = "Bunny Hop (chain jumps automatically)",
+    Name = "Bunny Hop",
     CurrentValue = false, Flag = "BunnyHop",
     Callback = function(v) SetBunnyHop(v) end,
 })
 
-TabP:CreateSection("Gravity and Physics")
+TabP:CreateSection("Gravity")
 TabP:CreateToggle({
-    Name = "Low Gravity (mimics mutator)",
+    Name = "Low Gravity",
     CurrentValue = false, Flag = "LowGravity",
     Callback = function(v) SetLowGravity(v) end,
 })
@@ -993,24 +1034,24 @@ TabP:CreateSlider({
     end,
 })
 TabP:CreateToggle({
-    Name = "Slow Fall (cap fall speed)",
+    Name = "Slow Fall",
     CurrentValue = false, Flag = "SlowFall",
     Callback = function(v) SetSlowFall(v) end,
 })
 TabP:CreateToggle({
-    Name = "Noclip (pass through everything)",
+    Name = "Noclip",
     CurrentValue = false, Flag = "Noclip",
     Callback = function(v) SetNoclip(v) end,
 })
 
 TabP:CreateSection("Survival")
 TabP:CreateToggle({
-    Name = "God Mode (disables kill parts)",
+    Name = "God Mode",
     CurrentValue = false, Flag = "GodMode",
     Callback = function(v) SetGodMode(v) end,
 })
 TabP:CreateToggle({
-    Name = "Anti-Void (catch falls)",
+    Name = "Anti-Void",
     CurrentValue = false, Flag = "AntiVoid",
     Callback = function(v) SetAntiVoid(v) end,
 })
@@ -1019,10 +1060,15 @@ TabP:CreateToggle({
     CurrentValue = false, Flag = "AntiRagdoll",
     Callback = function(v) SetAntiRagdoll(v) end,
 })
+TabP:CreateToggle({
+    Name = "Auto Respawn on Fall",
+    CurrentValue = false, Flag = "AutoRespawn",
+    Callback = function(v) SetAutoRespawn(v) end,
+})
 
 TabP:CreateSection("Fly")
 TabP:CreateToggle({
-    Name = "Fly (WASD + Space / Shift)",
+    Name = "Fly  (WASD + Space / Shift)",
     CurrentValue = false, Flag = "Fly",
     Callback = function(v) SetFly(v) end,
 })
@@ -1039,21 +1085,24 @@ local TabT = Window:CreateTab("Tower", 4483362458)
 
 TabT:CreateSection("Auto Finish")
 TabT:CreateButton({
-    Name = "Auto Complete (press again to cancel)",
+    Name = "Auto Complete  (press again to cancel)",
     Callback = function() AutoComplete() end,
 })
-TabT:CreateSection("Obstacles")
+
+TabT:CreateSection("Sections")
 TabT:CreateButton({
-    Name = "Skip One Level (press again to cancel)",
+    Name = "Skip One Section  (press again to cancel)",
     Callback = function() SkipSection() end,
 })
 TabT:CreateToggle({
-    Name = "Auto Climb (auto move and jump)",
+    Name = "Auto Climb",
     CurrentValue = false, Flag = "AutoClimb",
     Callback = function(v) SetAutoClimb(v) end,
 })
+
+TabT:CreateSection("Obstacles")
 TabT:CreateToggle({
-    Name = "Freeze Moving Obstacles",
+    Name = "Freeze Moving Obstacles  (waits 1.5s to detect)",
     CurrentValue = false, Flag = "FreezeObst",
     Callback = function(v) SetFreezeObst(v) end,
 })
@@ -1072,7 +1121,7 @@ for i = 1, 5 do
             local hrp = HRP()
             if hrp then
                 _slots[idx] = hrp.CFrame
-                Notify("ch4rlies hub", "Slot " .. idx .. " saved!", 2)
+                Notify("ch4rlies hub", "Slot "..idx.." saved!", 2)
             end
         end,
     })
@@ -1082,9 +1131,9 @@ for i = 1, 5 do
             local hrp = HRP()
             if hrp and _slots[idx] then
                 hrp.CFrame = _slots[idx]
-                Notify("ch4rlies hub", "Slot " .. idx .. " loaded!", 2)
+                Notify("ch4rlies hub", "Slot "..idx.." loaded!", 2)
             else
-                Notify("ch4rlies hub", "Slot " .. idx .. " is empty!", 2)
+                Notify("ch4rlies hub", "Slot "..idx.." is empty!", 2)
             end
         end,
     })
@@ -1107,28 +1156,40 @@ TabT:CreateButton({
 -- ============================================================
 local TabV = Window:CreateTab("Visuals", 4483362458)
 
-TabV:CreateSection("Danger")
+TabV:CreateSection("ESP")
 TabV:CreateToggle({
-    Name = "Kill Brick ESP (red highlights)",
+    Name = "Kill Brick ESP  (red)",
     CurrentValue = false, Flag = "KillESP",
     Callback = function(v) SetKillESP(v) end,
 })
 TabV:CreateToggle({
-    Name = "Safe Platform ESP (green highlights)",
+    Name = "Safe Platform ESP  (green)",
     CurrentValue = false, Flag = "SafeESP",
     Callback = function(v) SetSafeESP(v) end,
 })
-TabV:CreateSection("Environment")
+TabV:CreateToggle({
+    Name = "Player ESP",
+    CurrentValue = false, Flag = "PlayerESP",
+    Callback = function(v) SetPlayerESP(v) end,
+})
+
+TabV:CreateSection("World")
 TabV:CreateToggle({
     Name = "Fullbright",
     CurrentValue = false, Flag = "Fullbright",
     Callback = function(v) SetFullbright(v) end,
 })
-TabV:CreateSection("Players")
+
+TabV:CreateSection("Character")
 TabV:CreateToggle({
-    Name = "Player ESP",
-    CurrentValue = false, Flag = "PlayerESP",
-    Callback = function(v) SetPlayerESP(v) end,
+    Name = "Rainbow Character",
+    CurrentValue = false, Flag = "Rainbow",
+    Callback = function(v) SetRainbow(v) end,
+})
+TabV:CreateSlider({
+    Name = "Rainbow Speed", Range = {1, 20}, Increment = 1,
+    Suffix = "x", CurrentValue = 8, Flag = "RainbowSpeed",
+    Callback = function(v) _rainbowTick = v * 0.1 end,
 })
 
 -- ============================================================
@@ -1152,6 +1213,7 @@ TabM:CreateButton({
     Callback = function()
         NullifyKick()
         DisableKillScript()
+        InstallHooks()
         Notify("ch4rlies hub", "Bypasses re-applied!", 3)
     end,
 })
@@ -1161,6 +1223,11 @@ TabM:CreateToggle({
     Name = "Anti-AFK",
     CurrentValue = false, Flag = "AntiAFK",
     Callback = function(v) SetAntiAFK(v) end,
+})
+TabM:CreateToggle({
+    Name = "Mute Game Sounds",
+    CurrentValue = false, Flag = "Mute",
+    Callback = function(v) SetMute(v) end,
 })
 TabM:CreateButton({
     Name = "Respawn Character",
@@ -1172,20 +1239,19 @@ TabM:CreateButton({
         pcall(function()
             setclipboard(
                 'game:GetService("TeleportService"):TeleportToPlaceInstance('
-                .. game.PlaceId .. ',"' .. game.JobId
-                .. '",game.Players.LocalPlayer)'
+                ..game.PlaceId..',"'..game.JobId
+                ..'",game.Players.LocalPlayer)'
             )
-            Notify("ch4rlies hub", "Copied to clipboard!", 2)
+            Notify("ch4rlies hub", "Copied!", 2)
         end)
     end,
 })
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub | v7.1 | Tower of Hell")
-TabM:CreateLabel("4-Layer God Mode | Platform Skip | 50 st/s Climb")
-TabM:CreateLabel("Fly - God Mode - Kill ESP - BHop - Freeze")
+TabM:CreateLabel("ch4rlies hub  |  v8.0  |  Tower of Hell")
+TabM:CreateLabel("Motion-detect Freeze  |  Section Skip  |  Rainbow")
+TabM:CreateLabel("All bypasses active on load and respawn")
 
--- Load config
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v7.1", "God Mode fixed. Platform skip active!", 5)
+Notify("ch4rlies hub v8.0", "Fully rebuilt. Freeze and skip fixed!", 5)
