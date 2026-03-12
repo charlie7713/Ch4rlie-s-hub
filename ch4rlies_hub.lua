@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.0
+-- ch4rlies hub | Tower of Hell | v10.1
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -57,7 +57,10 @@ local cfg = {
     PlayerESP   = false, AntiAFK    = false,
     WallTransp  = false, Rainbow    = false,
     Mute        = false, AutoRespawn= false,
-    RainbowSpd  = 0.8,
+    Invisible   = false, Spin       = false,
+    ClickTP     = false, ThirdPerson= false,
+    RainbowSpd  = 0.8,  SpinSpd    = 6,
+    FOV         = 70,   ThirdDist  = 20,
 }
 
 local DEFAULT_GRAVITY = 196.2
@@ -301,66 +304,114 @@ local function SetNoclip(v)
 end
 
 -- ============================================================
--- GOD MODE (4 layers)
+-- GOD MODE (reworked - no per-frame health writes)
+--
+-- Previous version wrote health every RenderStepped frame which
+-- fought Roblox's character state machine and caused animation
+-- glitches (stuck poses, physics spazzing). Fixed approach:
+--
+--  Layer 1: CanTouch=false on kill-named parts (Heartbeat re-enforce)
+--  Layer 2: __namecall hook blocks TakeDamage + Kick (InstallHooks)
+--  Layer 3: __newindex hook drops Health writes below 50% MaxHealth
+--  Layer 4: HealthChanged event - reactive, debounced restore
+--           Only fires when health actually changes. Debounced
+--           so it never writes more than once per 0.1s, preventing
+--           the feedback loop that causes character glitches.
+--  Layer 5: Died event - safe pos restore with proper timing
+--           Waits for character to fully respawn before restoring.
+--
+-- RenderStepped is ONLY used to track safe position now.
+-- Health is NEVER written on a loop - only reactively.
 -- ============================================================
+local _godHealCooldown = false
+
+local function RestoreHealth()
+    if _godHealCooldown then return end
+    _godHealCooldown = true
+    task.spawn(function()
+        task.wait(0.08)
+        local h = Hum()
+        if h and cfg.GodMode then
+            pcall(function() h.Health = h.MaxHealth end)
+        end
+        task.wait(0.02)
+        _godHealCooldown = false
+    end)
+end
+
 local function SetGodMode(v)
     cfg.GodMode = v
     Conn("god_scan") Conn("god_hb") Conn("god_rs") Conn("god_hc") Conn("god_died")
+    _godHealCooldown = false
+
     if v then
         InstallHooks()
         DisableKillScript()
+
+        -- Layer 1: disable touch on all existing kill parts
         for _, obj in ipairs(workspace:GetDescendants()) do
             if IsKillPart(obj) then
                 pcall(function() obj.CanTouch = false _killCache[obj] = true end)
             end
         end
+        -- Layer 1: catch newly added kill parts
         _conns["god_scan"] = workspace.DescendantAdded:Connect(function(obj)
             if IsKillPart(obj) then
                 pcall(function() obj.CanTouch = false _killCache[obj] = true end)
             end
         end)
+        -- Layer 1: re-enforce CanTouch=false (servers can reset it)
         _conns["god_hb"] = RunService.Heartbeat:Connect(function()
             for p,_ in pairs(_killCache) do
                 if p and p.Parent then pcall(function() p.CanTouch = false end)
                 else _killCache[p] = nil end
             end
         end)
+
+        -- RenderStepped: ONLY track safe position, no health writes
         _conns["god_rs"] = RunService.RenderStepped:Connect(function()
-            local hrp = HRP() local h = Hum()
-            if not hrp or not h then return end
-            if hrp.Position.Y > -30 then _godSafePos = hrp.CFrame end
-            if h.Health < h.MaxHealth then
-                pcall(function() sethiddenproperty(h,"Health",h.MaxHealth) end)
-                pcall(function() h.Health = h.MaxHealth end)
+            local hrp = HRP()
+            if hrp and hrp.Position.Y > -30 then
+                _godSafePos = hrp.CFrame
             end
         end)
+
+        -- Layer 4: reactive HealthChanged hook (debounced)
         local function HookHealth(char)
             local h = char and char:FindFirstChildOfClass("Humanoid")
             if not h then return end
             Conn("god_hc")
             _conns["god_hc"] = h.HealthChanged:Connect(function(hp)
-                if not cfg.GodMode or hp >= h.MaxHealth then return end
-                pcall(function() sethiddenproperty(h,"Health",h.MaxHealth) end)
-                pcall(function() h.Health = h.MaxHealth end)
+                if not cfg.GodMode then return end
+                if hp < h.MaxHealth and hp > 0 then
+                    RestoreHealth()
+                end
             end)
+            -- Layer 5: Died handler
             Conn("god_died")
             _conns["god_died"] = h.Died:Connect(function()
                 if not cfg.GodMode then return end
-                task.wait(0.05)
-                local h2 = Hum() local hrp2 = HRP()
-                if h2 and hrp2 then
-                    pcall(function() sethiddenproperty(h2,"Health",h2.MaxHealth) end)
-                    pcall(function() h2.Health = h2.MaxHealth end)
-                    if _godSafePos then hrp2.CFrame = _godSafePos end
+                -- Wait for character to be in a stable state before restoring
+                task.wait(0.15)
+                local h2   = Hum()
+                local hrp2 = HRP()
+                if not h2 or not hrp2 then return end
+                -- Only teleport back if we have a safe position stored
+                if _godSafePos then
+                    hrp2.CFrame = _godSafePos
                 end
+                task.wait(0.05)
+                pcall(function() h2.Health = h2.MaxHealth end)
             end)
         end
+
         HookHealth(Char())
     else
         for p,_ in pairs(_killCache) do
             if p and p.Parent then pcall(function() p.CanTouch = true end) end
         end
         _killCache = {}
+        _godHealCooldown = false
     end
 end
 
@@ -887,6 +938,147 @@ local function SkipSection()
 end
 
 -- ============================================================
+-- FOV
+-- ============================================================
+local _origFOV = 70
+local function SetFOV(v)
+    cfg.FOV = v
+    Camera.FieldOfView = v
+end
+
+-- ============================================================
+-- INVISIBLE (local - your character turns transparent to you)
+-- Other players still see you normally (client-side only)
+-- ============================================================
+local _invisOrig = {}
+local function SetInvisible(v)
+    cfg.Invisible = v
+    local c = Char()
+    if not c then return end
+    if v then
+        for _, p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") then
+                _invisOrig[p] = p.LocalTransparencyModifier
+                pcall(function() p.LocalTransparencyModifier = 1 end)
+            end
+        end
+    else
+        for p, t in pairs(_invisOrig) do
+            if p and p.Parent then
+                pcall(function() p.LocalTransparencyModifier = t end)
+            end
+        end
+        _invisOrig = {}
+    end
+end
+
+-- ============================================================
+-- SPIN CHARACTER
+-- ============================================================
+local function SetSpin(v)
+    cfg.Spin = v Conn("spin")
+    if not v then return end
+    _conns["spin"] = RunService.RenderStepped:Connect(function(dt)
+        local hrp = HRP() if not hrp then return end
+        hrp.CFrame = hrp.CFrame * CFrame.fromEulerAnglesXYZ(0, dt * (cfg.SpinSpd or 6), 0)
+    end)
+end
+
+-- ============================================================
+-- CLICK TELEPORT
+-- Click any surface in the world to teleport there
+-- ============================================================
+local function SetClickTP(v)
+    cfg.ClickTP = v Conn("clicktp")
+    if not v then return end
+    _conns["clicktp"] = UserInputService.InputBegan:Connect(function(inp, gp)
+        if gp then return end
+        if inp.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        if not cfg.ClickTP then return end
+        local ray    = Camera:ScreenPointToRay(inp.Position.X, inp.Position.Y)
+        local result = workspace:Raycast(ray.Origin, ray.Direction * 1000,
+            RaycastParams.new())
+        if result then
+            local hrp = HRP()
+            if hrp then
+                hrp.CFrame = CFrame.new(result.Position + Vector3.new(0, 3.5, 0))
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- SPEED BOOST (temporary 3-second burst)
+-- ============================================================
+local _boostActive = false
+local function SpeedBoost()
+    if _boostActive then
+        Notify("ch4rlies hub","Boost already active!",2)
+        return
+    end
+    _boostActive = true
+    local oldSpeed = cfg.WalkSpeed
+    ApplySpeed(100)
+    Notify("ch4rlies hub","Speed boost active for 3 seconds!",3)
+    task.spawn(function()
+        task.wait(3)
+        ApplySpeed(oldSpeed)
+        _boostActive = false
+        Notify("ch4rlies hub","Speed boost ended.",2)
+    end)
+end
+
+-- ============================================================
+-- SECTION PROGRESS (tells you which section you are on)
+-- ============================================================
+local function ShowProgress()
+    local hrp = HRP()
+    if not hrp then return end
+    local list = GetSortedSections()
+    if #list == 0 then
+        Notify("ch4rlies hub","No sections found!",3)
+        return
+    end
+    local current = nil
+    local currentNum = 0
+    local total = #list
+    for i, s in ipairs(list) do
+        if hrp.Position.Y >= s.Y - 10 then
+            current    = s
+            currentNum = i
+        end
+    end
+    if not current then
+        Notify("ch4rlies hub","Below section 1 (at spawn)",3)
+    else
+        Notify("ch4rlies hub",
+            "Section "..currentNum.." of "..total.."  -  "..current.name, 4)
+    end
+end
+
+-- ============================================================
+-- THIRDPERSON LOCK (locks camera zoom to a set distance)
+-- ============================================================
+local function SetThirdPerson(v, dist)
+    cfg.ThirdPerson = v
+    dist = dist or cfg.ThirdDist or 20
+    cfg.ThirdDist = dist
+    Conn("thirdperson")
+    if not v then
+        LP.CameraMaxZoomDistance = 128
+        LP.CameraMinZoomDistance = 0.5
+        return
+    end
+    LP.CameraMaxZoomDistance = dist
+    LP.CameraMinZoomDistance = dist
+    _conns["thirdperson"] = RunService.Heartbeat:Connect(function()
+        if not cfg.ThirdPerson then return end
+        LP.CameraMaxZoomDistance = cfg.ThirdDist
+        LP.CameraMinZoomDistance = cfg.ThirdDist
+    end)
+end
+
+-- ============================================================
 -- SERVER HOP
 -- ============================================================
 local function ServerHop()
@@ -940,11 +1132,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.0",
+    LoadingSubtitle = "Tower of Hell  |  v10.1",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v10"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v101"},
     KeySystem = false,
 })
 
@@ -994,6 +1186,32 @@ TabP:CreateSlider({Name="Fly Speed",Range={10,200},Increment=5,
     Suffix=" studs/s",CurrentValue=55,Flag="FlySpeed",
     Callback=function(v) cfg.FlySpeed = v end})
 
+TabP:CreateSection("Camera")
+TabP:CreateSlider({Name="Field of View",Range={50,120},Increment=1,
+    Suffix=" deg",CurrentValue=70,Flag="FOV",
+    Callback=function(v) SetFOV(v) end})
+TabP:CreateToggle({Name="Lock Camera Distance  (3rd person lock)",
+    CurrentValue=false,Flag="ThirdPerson",
+    Callback=function(v) SetThirdPerson(v) end})
+TabP:CreateSlider({Name="Camera Distance",Range={5,80},Increment=1,
+    Suffix=" studs",CurrentValue=20,Flag="ThirdDist",
+    Callback=function(v)
+        cfg.ThirdDist = v
+        if cfg.ThirdPerson then SetThirdPerson(true, v) end
+    end})
+
+TabP:CreateSection("Utility")
+TabP:CreateToggle({Name="Click Teleport  (left click to teleport)",
+    CurrentValue=false,Flag="ClickTP",
+    Callback=function(v) SetClickTP(v) end})
+TabP:CreateButton({Name="Speed Boost  (100 studs/s for 3 seconds)",
+    Callback=function() SpeedBoost() end})
+TabP:CreateToggle({Name="Fly  (WASD + Space / Shift)",CurrentValue=false,Flag="Fly",
+    Callback=function(v) SetFly(v) end})
+TabP:CreateSlider({Name="Fly Speed",Range={10,200},Increment=5,
+    Suffix=" studs/s",CurrentValue=55,Flag="FlySpeed",
+    Callback=function(v) cfg.FlySpeed = v end})
+
 -- TOWER TAB
 local TabT = Window:CreateTab("Tower", 4483362458)
 
@@ -1002,8 +1220,12 @@ TabT:CreateButton({Name="Auto Complete  (press again to cancel)",
     Callback=function() AutoComplete() end})
 
 TabT:CreateSection("Sections")
+TabT:CreateLabel("WARNING: Skipping too quickly may get you banned!")
+TabT:CreateLabel("Wait a few seconds between skips to stay safe.")
 TabT:CreateButton({Name="Skip One Section  (press again to cancel)",
     Callback=function() SkipSection() end})
+TabT:CreateButton({Name="My Section Progress",
+    Callback=function() ShowProgress() end})
 TabT:CreateToggle({Name="Auto Climb",CurrentValue=false,Flag="AutoClimb",
     Callback=function(v) SetAutoClimb(v) end})
 
@@ -1059,6 +1281,13 @@ TabV:CreateToggle({Name="Rainbow Character",CurrentValue=false,Flag="Rainbow",
 TabV:CreateSlider({Name="Rainbow Speed",Range={1,20},Increment=1,
     Suffix="x",CurrentValue=8,Flag="RainbowSpeed",
     Callback=function(v) cfg.RainbowSpd = v * 0.1 end})
+TabV:CreateToggle({Name="Invisible  (client-side only)",CurrentValue=false,Flag="Invisible",
+    Callback=function(v) SetInvisible(v) end})
+TabV:CreateToggle({Name="Spin Character",CurrentValue=false,Flag="Spin",
+    Callback=function(v) SetSpin(v) end})
+TabV:CreateSlider({Name="Spin Speed",Range={1,20},Increment=1,
+    Suffix="x",CurrentValue=6,Flag="SpinSpd",
+    Callback=function(v) cfg.SpinSpd = v end})
 
 -- MISC TAB
 local TabM = Window:CreateTab("Misc", 4483362458)
@@ -1114,10 +1343,10 @@ TabM:CreateButton({Name="Print Section List to Output",
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.0  |  Tower of Hell")
-TabM:CreateLabel("Cubic Bezier smooth climb  |  Real ToH paths")
+TabM:CreateLabel("ch4rlies hub  |  v10.1  |  Tower of Hell")
+TabM:CreateLabel("God Mode reworked  |  FOV + Click TP + Spin + Invisible")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.0","Smooth Bezier climb + real section paths!",5)
+Notify("ch4rlies hub v10.1","God Mode fixed + 6 new features added!",5)
