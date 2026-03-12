@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.1
+-- ch4rlies hub | Tower of Hell | v10.2
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -59,6 +59,7 @@ local cfg = {
     Mute        = false, AutoRespawn= false,
     Invisible   = false, Spin       = false,
     ClickTP     = false, ThirdPerson= false,
+    AutoFarm    = false,
     RainbowSpd  = 0.8,  SpinSpd    = 6,
     FOV         = 70,   ThirdDist  = 20,
 }
@@ -1079,6 +1080,179 @@ local function SetThirdPerson(v, dist)
 end
 
 -- ============================================================
+-- TELEPORT TO PLAYER
+-- ============================================================
+local function TeleportToPlayer(name)
+    if not name or name == "" or name == "Select a player..." then
+        Notify("ch4rlies hub","Select a player first!",2)
+        return
+    end
+    local target = Players:FindFirstChild(name)
+    if not target then
+        Notify("ch4rlies hub","Player not found: "..name,3)
+        return
+    end
+    if target == LP then
+        Notify("ch4rlies hub","That's you!",2)
+        return
+    end
+    local tc = target.Character
+    local thrp = tc and tc:FindFirstChild("HumanoidRootPart")
+    if not thrp then
+        Notify("ch4rlies hub",name.." has no character loaded.",3)
+        return
+    end
+    local hrp = HRP()
+    if not hrp then return end
+    -- Land 4 studs behind them so we don't clip inside them
+    local behind = thrp.CFrame * CFrame.new(0, 0, 4)
+    hrp.CFrame = behind
+    Notify("ch4rlies hub","Teleported to "..name.."!",3)
+end
+
+-- Build player name list for dropdown (refreshed on open)
+local function GetPlayerNames()
+    local names = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP then
+            table.insert(names, p.Name)
+        end
+    end
+    if #names == 0 then
+        table.insert(names, "No other players")
+    end
+    return names
+end
+
+-- ============================================================
+-- AUTO FARM
+-- Detects the start of each new round by watching for the
+-- tower being regenerated (workspace.tower replaced) or the
+-- player's character being respawned to spawn position.
+--
+-- Round lifecycle in ToH:
+--   1. Round ends -> all players teleported to lobby/spawn
+--   2. New tower generates in workspace.tower
+--   3. Round countdown starts
+--   4. Players can enter the tower
+--
+-- Strategy: watch LP.CharacterAdded (fires every round reset)
+-- Then wait for workspace.tower.sections to populate with the
+-- new sections (poll until GetSortedSections returns results)
+-- Then wait a small extra delay, then run AutoComplete.
+-- ============================================================
+local _autoFarmActive  = false
+local _autoFarmConn    = nil
+local _autoFarmRounds  = 0
+
+local function StopAutoFarm()
+    _autoFarmActive = false
+    if _autoFarmConn then
+        _autoFarmConn:Disconnect()
+        _autoFarmConn = nil
+    end
+    Notify("ch4rlies hub","Auto Farm stopped. Rounds farmed: ".._autoFarmRounds,4)
+    _autoFarmRounds = 0
+end
+
+local function RunFarmRound()
+    -- Wait for the tower sections to be populated in this round
+    -- Poll up to 20 seconds for sections to appear
+    local waited = 0
+    while waited < 20 do
+        if not _autoFarmActive then return end
+        local list = GetSortedSections()
+        if #list > 0 then break end
+        task.wait(0.5)
+        waited = waited + 0.5
+    end
+    if not _autoFarmActive then return end
+
+    local list = GetSortedSections()
+    if #list == 0 then
+        Notify("ch4rlies hub","Auto Farm: Tower not found this round, retrying next.",3)
+        return
+    end
+
+    -- Extra 2s buffer so the round countdown has started
+    task.wait(2)
+    if not _autoFarmActive then return end
+
+    _autoFarmRounds = _autoFarmRounds + 1
+    Notify("ch4rlies hub","Auto Farm: Starting round ".._autoFarmRounds.."...",3)
+
+    -- Run the same logic as AutoComplete
+    local target = nil
+    pcall(function()
+        local fg = workspace.tower.sections.finish.FinishGlow
+        target = fg.CFrame.Position + Vector3.new(0, 3, 0)
+    end)
+    if not target then
+        local topList = GetSortedSections()
+        if #topList > 0 then
+            local top = topList[#topList]
+            target = top.pos + Vector3.new(0, 3.5, 0)
+        end
+    end
+    if not target then
+        Notify("ch4rlies hub","Auto Farm: Couldn't find finish this round.",3)
+        return
+    end
+
+    -- Use BezierClimb with a callback so we know when it's done
+    local done = false
+    BezierClimb(target, function()
+        RestoreForCoins()
+        done = true
+        Notify("ch4rlies hub","Auto Farm: Round ".._autoFarmRounds.." complete! Waiting for next round...",4)
+    end)
+
+    -- Wait for climb to finish or timeout (90 seconds max per round)
+    local elapsed = 0
+    while not done and elapsed < 90 do
+        if not _autoFarmActive then
+            _climbActive = false
+            return
+        end
+        task.wait(0.5)
+        elapsed = elapsed + 0.5
+    end
+end
+
+local function SetAutoFarm(v)
+    cfg.AutoFarm = v
+    if not v then
+        StopAutoFarm()
+        return
+    end
+    _autoFarmActive = true
+    _autoFarmRounds = 0
+    Notify("ch4rlies hub","Auto Farm ON - will complete every round automatically!",4)
+
+    -- Hook CharacterAdded so we act on every new round respawn
+    _autoFarmConn = LP.CharacterAdded:Connect(function()
+        if not _autoFarmActive then return end
+        -- Short wait for character to fully load
+        task.wait(1.5)
+        if not _autoFarmActive then return end
+        task.spawn(RunFarmRound)
+    end)
+
+    -- Also run immediately for the current round if we're already in one
+    task.spawn(function()
+        task.wait(0.5)
+        if not _autoFarmActive then return end
+        local list = GetSortedSections()
+        if #list > 0 then
+            Notify("ch4rlies hub","Auto Farm: Completing current round now...",3)
+            RunFarmRound()
+        else
+            Notify("ch4rlies hub","Auto Farm: Waiting for next round to start...",3)
+        end
+    end)
+end
+
+-- ============================================================
 -- SERVER HOP
 -- ============================================================
 local function ServerHop()
@@ -1132,11 +1306,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.1",
+    LoadingSubtitle = "Tower of Hell  |  v10.2",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v101"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v102"},
     KeySystem = false,
 })
 
@@ -1218,6 +1392,10 @@ local TabT = Window:CreateTab("Tower", 4483362458)
 TabT:CreateSection("Auto Finish")
 TabT:CreateButton({Name="Auto Complete  (press again to cancel)",
     Callback=function() AutoComplete() end})
+TabT:CreateToggle({Name="Auto Farm  (completes every round automatically)",
+    CurrentValue=false,Flag="AutoFarm",
+    Callback=function(v) SetAutoFarm(v) end})
+TabT:CreateLabel("Auto Farm uses the same climb as Auto Complete")
 
 TabT:CreateSection("Sections")
 TabT:CreateLabel("WARNING: Skipping too quickly may get you banned!")
@@ -1258,6 +1436,96 @@ TabT:CreateButton({Name="Return to Spawn",
     Callback=function()
         local hrp = HRP()
         if hrp then hrp.CFrame = CFrame.new(0,10,0) Notify("ch4rlies hub","Teleported to spawn.",2) end
+    end})
+
+-- PLAYERS TAB
+local TabPL = Window:CreateTab("Players", 4483362458)
+
+TabPL:CreateSection("Teleport to Player")
+TabPL:CreateLabel("Select a player then press Teleport.")
+
+-- Build initial player list
+local _selectedPlayer = ""
+local _playerDropdown = nil
+
+local function RefreshPlayerList()
+    local names = GetPlayerNames()
+    if _playerDropdown then
+        -- Rayfield dropdowns support :Refresh(newOptions, newDefault)
+        pcall(function()
+            _playerDropdown:Refresh(names, true)
+        end)
+    end
+    Notify("ch4rlies hub","Player list refreshed! ("..#names.." players)",2)
+end
+
+_playerDropdown = TabPL:CreateDropdown({
+    Name    = "Select Player",
+    Options = GetPlayerNames(),
+    CurrentOption = {""},
+    Flag    = "SelectedPlayer",
+    Callback = function(selected)
+        if type(selected) == "table" then
+            _selectedPlayer = selected[1] or ""
+        else
+            _selectedPlayer = selected or ""
+        end
+    end,
+})
+
+TabPL:CreateButton({Name="Teleport to Selected Player",
+    Callback=function() TeleportToPlayer(_selectedPlayer) end})
+TabPL:CreateButton({Name="Refresh Player List",
+    Callback=function() RefreshPlayerList() end})
+
+TabPL:CreateSection("Follow Player")
+TabPL:CreateLabel("Continuously teleports you to a player.")
+TabPL:CreateLabel("Uses the same player selected in the dropdown above.")
+
+local _followActive = false
+local function SetFollowPlayer(v)
+    _followActive = v Conn("follow")
+    if not v then Notify("ch4rlies hub","Follow stopped.",2) return end
+    _conns["follow"] = RunService.Heartbeat:Connect(function()
+        if not _followActive then return end
+        if _selectedPlayer == "" then return end
+        local tp = Players:FindFirstChild(_selectedPlayer)
+        if not tp then return end
+        local tc = tp.Character
+        local thrp = tc and tc:FindFirstChild("HumanoidRootPart")
+        local hrp = HRP()
+        if not thrp or not hrp then return end
+        -- Only move if we're more than 8 studs away to avoid jitter
+        if (hrp.Position - thrp.Position).Magnitude > 8 then
+            hrp.CFrame = thrp.CFrame * CFrame.new(0, 0, 4)
+        end
+    end)
+    Notify("ch4rlies hub","Following "..(_selectedPlayer~="" and _selectedPlayer or "nobody").."...",3)
+end
+
+TabPL:CreateToggle({Name="Follow Selected Player",CurrentValue=false,Flag="FollowPlayer",
+    Callback=function(v) SetFollowPlayer(v) end})
+
+TabPL:CreateSection("All Players")
+TabPL:CreateButton({Name="Bring All Players to Me",
+    Callback=function()
+        local hrp = HRP()
+        if not hrp then return end
+        local count = 0
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP then
+                local tc = p.Character
+                local thrp = tc and tc:FindFirstChild("HumanoidRootPart")
+                if thrp then
+                    -- Scatter them around you in a circle
+                    local angle = (count / math.max(#Players:GetPlayers()-1,1)) * math.pi * 2
+                    local offset = Vector3.new(math.cos(angle)*5, 0, math.sin(angle)*5)
+                    pcall(function() thrp.CFrame = CFrame.new(hrp.Position + offset) end)
+                    count = count + 1
+                end
+            end
+        end
+        Notify("ch4rlies hub","Brought "..count.." players to you!",3)
     end})
 
 -- VISUALS TAB
@@ -1343,10 +1611,10 @@ TabM:CreateButton({Name="Print Section List to Output",
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.1  |  Tower of Hell")
-TabM:CreateLabel("God Mode reworked  |  FOV + Click TP + Spin + Invisible")
+TabM:CreateLabel("ch4rlies hub  |  v10.2  |  Tower of Hell")
+TabM:CreateLabel("Auto Farm  |  Teleport to Player  |  Follow Player")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.1","God Mode fixed + 6 new features added!",5)
+Notify("ch4rlies hub v10.2","Auto Farm + Teleport to Player added!",5)
