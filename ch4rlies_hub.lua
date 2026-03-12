@@ -1,5 +1,5 @@
--- ch4rlies hub | Tower of Hell | v7.0
--- 100% ASCII | Lua 5.1 | Climb speed 50 studs/s (safe)
+-- ch4rlies hub | Tower of Hell | v7.1
+-- 100% ASCII | Lua 5.1 | 4-layer God Mode | Platform Skip
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
@@ -237,12 +237,61 @@ local function IsKillPart(p)
     return false
 end
 
+-- Installed once globally, stays active
+local _hooksInstalled = false
+local _godSafePos     = nil
+
+local function InstallHooks()
+    if _hooksInstalled then return end
+    _hooksInstalled = true
+    pcall(function()
+        local mt  = getrawmetatable(game)
+        local old_nc = mt.__namecall
+        local old_ni = mt.__newindex
+        setreadonly(mt, false)
+
+        -- __namecall: block TakeDamage and Kick
+        mt.__namecall = newcclosure(function(self, ...)
+            local m = getnamecallmethod()
+            if m == "Kick" and self == LP then return end
+            if cfg.GodMode and m == "TakeDamage" then
+                local h = Hum()
+                if h and self == h then return end
+            end
+            return old_nc(self, ...)
+        end)
+
+        -- __newindex: intercept Health writes on our Humanoid
+        mt.__newindex = newcclosure(function(self, key, val)
+            if cfg.GodMode and key == "Health" then
+                local h = Hum()
+                if h and self == h then
+                    -- Allow writes to MaxHealth or full-health sets, block zeroing
+                    if type(val) == "number" and val < h.MaxHealth * 0.5 then
+                        return  -- drop the damage write
+                    end
+                end
+            end
+            return old_ni(self, key, val)
+        end)
+
+        setreadonly(mt, true)
+    end)
+end
+
 local function SetGodMode(v)
     cfg.GodMode = v
     Conn("god_scan")
     Conn("god_hb")
+    Conn("god_rs")
+    Conn("god_hc")
+    Conn("god_died")
+
     if v then
+        InstallHooks()
         DisableKillScript()
+
+        -- Layer 1: CanTouch=false on all kill-named parts + re-scan new ones
         for _, obj in ipairs(workspace:GetDescendants()) do
             if obj:IsA("BasePart") and IsKillPart(obj) then
                 pcall(function() obj.CanTouch = false _killCache[obj] = true end)
@@ -253,13 +302,62 @@ local function SetGodMode(v)
                 pcall(function() obj.CanTouch = false _killCache[obj] = true end)
             end
         end)
+        -- Re-enforce CanTouch every heartbeat (some parts reset it)
         _conns["god_hb"] = RunService.Heartbeat:Connect(function()
             for p, _ in pairs(_killCache) do
-                if p and p.Parent then pcall(function() p.CanTouch = false end)
-                else _killCache[p] = nil end
+                if p and p.Parent then
+                    pcall(function() p.CanTouch = false end)
+                else
+                    _killCache[p] = nil
+                end
             end
         end)
+
+        -- Layer 2: RenderStepped health lock (runs before physics, fastest possible)
+        -- This catches any damage that slips through the __newindex hook.
+        _conns["god_rs"] = RunService.RenderStepped:Connect(function()
+            local hrp = HRP()
+            local h   = Hum()
+            if not hrp or not h then return end
+            if hrp.Position.Y > -30 then _godSafePos = hrp.CFrame end
+            local maxhp = h.MaxHealth
+            if h.Health < maxhp then
+                pcall(function() sethiddenproperty(h, "Health", maxhp) end)
+                pcall(function() h.Health = maxhp end)
+            end
+        end)
+
+        -- Layer 3: HealthChanged event hook - fires the instant health changes
+        -- This is the fastest possible reactive reset.
+        local function HookHealth(char)
+            local h = char and char:FindFirstChildOfClass("Humanoid")
+            if not h then return end
+            Conn("god_hc")
+            _conns["god_hc"] = h.HealthChanged:Connect(function(newHp)
+                if not cfg.GodMode then return end
+                if newHp < h.MaxHealth then
+                    pcall(function() sethiddenproperty(h, "Health", h.MaxHealth) end)
+                    pcall(function() h.Health = h.MaxHealth end)
+                end
+            end)
+            -- Layer 4: Died hook - if all else fails, restore and warp back
+            Conn("god_died")
+            _conns["god_died"] = h.Died:Connect(function()
+                if not cfg.GodMode then return end
+                task.wait(0.05)
+                local h2   = Hum()
+                local hrp2 = HRP()
+                if h2 and hrp2 then
+                    pcall(function() sethiddenproperty(h2, "Health", h2.MaxHealth) end)
+                    pcall(function() h2.Health = h2.MaxHealth end)
+                    if _godSafePos then hrp2.CFrame = _godSafePos end
+                end
+            end)
+        end
+        HookHealth(Char())
+
     else
+        -- Restore all kill parts
         for p, _ in pairs(_killCache) do
             if p and p.Parent then pcall(function() p.CanTouch = true end) end
         end
@@ -696,39 +794,74 @@ end
 -- SKIP SECTION  (same ClimbTo system, shorter distance)
 -- Rises 20 up, moves 35 forward, stops
 -- ============================================================
-local function SkipSection()
+-- ============================================================
+-- FIND NEXT PLATFORM
+-- Scans all BaseParts above the player's current Y.
+-- Picks the lowest walkable platform (large enough to stand on)
+-- that is higher than current position. This is the "next level".
+-- ============================================================
+local function FindNextPlatform()
     local hrp = HRP()
-    if not hrp then return end
+    if not hrp then return nil end
 
-    local fwd  = hrp.CFrame.LookVector
-    local flat = Vector3.new(fwd.X, 0, fwd.Z)
-    local dir  = flat.Magnitude > 0 and flat.Unit or Vector3.new(0, 0, -1)
+    local currentY = hrp.Position.Y
+    local ign      = Char()
+    local best     = nil
+    local bestY    = math.huge
 
-    local risePos = hrp.Position + Vector3.new(0, 20, 0)
-    local fwdPos  = risePos + dir * 35
+    -- Find the lowest platform surface that is at least 5 studs above us.
+    -- "Platform" = not a kill part, at least 3x3 wide, at least 0.3 thick.
+    -- We look for the CLOSEST one upward (lowest bestY) so we always jump
+    -- exactly one section, not past multiple sections.
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart")
+        and (not ign or not obj:IsDescendantOf(ign))
+        and not IsKillPart(obj)
+        and obj.Size.X >= 3
+        and obj.Size.Z >= 3
+        and obj.Size.Y >= 0.3 then
+            local surfTop = obj.Position.Y + (obj.Size.Y / 2)
+            -- Must be above us by at least 5 studs (skip same-level decor)
+            -- Must be the LOWEST such platform found (one level up, not the top)
+            if surfTop > currentY + 5 and surfTop < bestY then
+                bestY = surfTop
+                best  = obj
+            end
+        end
+    end
 
+    return best
+end
+
+local function SkipSection()
     if _climbActive then
         _climbActive = false
         Notify("ch4rlies hub", "Cancelled.", 2)
         return
     end
-    _climbActive = true
 
-    local wasNoclip = cfg.Noclip
-    SetNoclip(true)
+    local hrp = HRP()
+    if not hrp then return end
 
-    task.spawn(function()
-        local p = HRP()
-        if p then StepPath(p.Position, risePos) end
-        if not _climbActive then
-            if not wasNoclip then SetNoclip(false) end
-            return
-        end
-        local p2 = HRP()
-        if p2 then StepPath(p2.Position, fwdPos) end
-        _climbActive = false
-        if not wasNoclip then SetNoclip(false) end
-        Notify("ch4rlies hub", "Section skipped!", 2)
+    local nextPlatform = FindNextPlatform()
+
+    local target
+    if nextPlatform then
+        -- Land centered on the platform surface
+        local surfY = nextPlatform.Position.Y + (nextPlatform.Size.Y / 2) + 3.5
+        target = Vector3.new(nextPlatform.Position.X, surfY, nextPlatform.Position.Z)
+        Notify("ch4rlies hub", "Skipping to next level...", 3)
+    else
+        -- Fallback: rise up 25 and go forward 30 in facing direction
+        local fwd  = hrp.CFrame.LookVector
+        local flat = Vector3.new(fwd.X, 0, fwd.Z)
+        local dir  = flat.Magnitude > 0 and flat.Unit or Vector3.new(0, 0, -1)
+        target = hrp.Position + Vector3.new(0, 25, 0) + dir * 30
+        Notify("ch4rlies hub", "No platform above - jumping forward!", 3)
+    end
+
+    ClimbTo(target, function()
+        Notify("ch4rlies hub", "Landed on next level!", 2)
     end)
 end
 
@@ -748,20 +881,6 @@ local function AutoComplete()
         RestoreForCoins()
         Notify("ch4rlies hub", "Reached the top!", 4)
     end)
-end
-
-local function TeleportTop()
-    local top, sz = FindTop()
-    local hrp = HRP()
-    if not hrp or not top then return false end
-    local surfY  = top.Position.Y + (sz.Y / 2) + 3.5
-    local target = Vector3.new(top.Position.X, surfY, top.Position.Z)
-    Notify("ch4rlies hub", "Climbing to top...", 3)
-    ClimbTo(target, function()
-        RestoreForCoins()
-        Notify("ch4rlies hub", "Reached the top!", 3)
-    end)
-    return true
 end
 
 -- ============================================================
@@ -824,7 +943,7 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub - Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell | v7.0",
+    LoadingSubtitle = "Tower of Hell | v7.1",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
@@ -923,14 +1042,6 @@ TabT:CreateButton({
     Name = "Auto Complete (press again to cancel)",
     Callback = function() AutoComplete() end,
 })
-TabT:CreateButton({
-    Name = "Teleport to Top",
-    Callback = function()
-        local ok = TeleportTop()
-        if not ok then Notify("ch4rlies hub", "Couldn't find tower top!", 3) end
-    end,
-})
-
 TabT:CreateSection("Obstacles")
 TabT:CreateButton({
     Name = "Skip One Level (press again to cancel)",
@@ -1070,11 +1181,11 @@ TabM:CreateButton({
 })
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub | v7.0 | Tower of Hell")
-TabM:CreateLabel("3-Phase Climb | 50 studs/s | Safe")
+TabM:CreateLabel("ch4rlies hub | v7.1 | Tower of Hell")
+TabM:CreateLabel("4-Layer God Mode | Platform Skip | 50 st/s Climb")
 TabM:CreateLabel("Fly - God Mode - Kill ESP - BHop - Freeze")
 
 -- Load config
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v7.0", "Loaded! Auto-complete rebuilt from scratch.", 5)
+Notify("ch4rlies hub v7.1", "God Mode fixed. Platform skip active!", 5)
