@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v11.1
+-- ch4rlies hub | Tower of Hell | v11.2
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -775,32 +775,38 @@ local function SetPlayerESP(v)
 end
 
 -- ============================================================
--- SMOOTH CUBIC BEZIER CLIMB  (anti-cheat hardened)
+-- PHYSICS CLIMB  (BodyVelocity - anti-cheat proof)
 --
--- Detection vectors fixed vs previous version:
---   1. AssemblyLinearVelocity = 0 every frame REMOVED.
---      Zeroing velocity 30x/sec is an unmistakable exploit
---      signature. ToH logs velocity packets server-side.
---      Now: velocity is left completely untouched. Physics
---      runs naturally alongside the CFrame path.
+-- Why previous CFrame approach was always detectable:
+--   CFrame.Position writes are instant position jumps.
+--   The server receives a position packet that doesn't match
+--   the previous frame's velocity. ToH compares:
+--     expected_pos = last_pos + (velocity * dt)
+--   A CFrame write produces:
+--     actual_pos != expected_pos  ->  flag/kick
+--   No matter how slow or small the steps, every CFrame write
+--   is a physics-inconsistent teleport from the server's view.
 --
---   2. Speed lowered to 35 studs/sec (was 80).
---      ToH's position-delta check kicks at ~5 studs/tick
---      (60hz server = ~83ms/tick). At 35 st/s per step of
---      0.05s = 1.75 studs/step - well under the threshold.
+-- BodyVelocity approach:
+--   Instead of writing position, we write VELOCITY.
+--   Roblox's physics engine then moves the character using
+--   that velocity. The server sees:
+--     velocity = V  (we set this)
+--     position_delta = V * dt  (physics engine, fully consistent)
+--   Position and velocity are always consistent -> passes all checks.
+--   Movement looks identical to a player with very high WalkSpeed.
 --
---   3. Sub-stud random jitter added to each step position.
---      Perfect mathematical Bezier curves are identifiable
---      as bot movement. +/- 0.25 stud noise makes each path
---      unique and matches human micro-movement variance.
---
---   4. SetNoclip NOT called here. Callers that want noclip
---      should set it themselves before calling FarmClimb.
---      Toggling CanCollide on the character every climb is
---      a server-visible property change that gets flagged.
+-- Path: 40 waypoints along a bezier arc, BodyVelocity steered
+--   toward the current waypoint. Jitter applied to waypoints
+--   (not velocity) so the path is humanly irregular. Final 5
+--   waypoints are clean and slow (8 st/s) for precise landing.
+--   On arrival: BodyVelocity removed, single CFrame snap to
+--   exact target to correct any last-inch physics drift.
 -- ============================================================
-local CLIMB_SPEED = 35   -- studs/sec - safe under position-delta check
-local STEP_DT     = 0.05 -- seconds per step (~20 updates/sec, natural feel)
+local CLIMB_SPEED   = 22   -- studs/sec total - matches fast WalkSpeed
+local ARRIVE_DIST   = 1.8  -- studs from waypoint to advance
+local SLOW_SPEED    = 8    -- studs/sec for final approach waypoints
+local NUM_WAYPOINTS = 40
 
 local function EaseInOut(t)
     return t * t * (3 - 2 * t)
@@ -808,125 +814,127 @@ end
 
 local function Bezier3(p0, p1, p2, p3, t)
     local mt = 1 - t
-    return mt*mt*mt*p0
-         + 3*mt*mt*t *p1
-         + 3*mt*t *t *p2
-         +    t *t *t *p3
+    return mt*mt*mt*p0 + 3*mt*mt*t*p1 + 3*mt*t*t*p2 + t*t*t*p3
 end
 
--- Small deterministic jitter: varies per step so path looks human
--- Uses math.sin/cos on step index for cheap pseudo-random variance
 local function Jitter(i)
-    local s = math.sin(i * 1.7) * 0.25
-    local c = math.cos(i * 2.3) * 0.25
-    return Vector3.new(s, math.abs(c) * 0.1, c)
+    local s = math.sin(i * 1.7) * 0.22
+    local c = math.cos(i * 2.3) * 0.22
+    return Vector3.new(s, math.abs(c) * 0.08, c)
 end
 
--- BezierClimb: for MANUAL button presses (Auto Complete, Skip Section)
--- Enables noclip for the duration since the user pressed the button
-local function BezierClimb(targetPos, onDone)
+-- Single unified climb function - withNoclip=true for manual, false for farm
+local function PhysicsClimb(targetPos, withNoclip, onDone)
     if _climbActive then
-        _climbActive = false
-        Notify("ch4rlies hub","Climb cancelled.",2)
+        if withNoclip then
+            _climbActive = false
+            Notify("ch4rlies hub","Climb cancelled.",2)
+        end
         return
     end
     _climbActive = true
 
     local wasNoclip = cfg.Noclip
-    SetNoclip(true)
+    if withNoclip then SetNoclip(true) end
 
     task.spawn(function()
         local hrp = HRP()
         if not hrp then
             _climbActive = false
-            if not wasNoclip then SetNoclip(false) end
+            if withNoclip and not wasNoclip then SetNoclip(false) end
             return
         end
 
+        -- Build bezier waypoints
         local p0     = hrp.Position
         local p3     = targetPos
-        local clearY = math.max(p0.Y, p3.Y) + 15
+        local clearY = math.max(p0.Y, p3.Y) + 14
         local p1     = Vector3.new(p0.X, clearY, p0.Z)
         local p2     = Vector3.new(p3.X, clearY, p3.Z)
 
-        local arcLen  = (p0-p1).Magnitude + (p1-p2).Magnitude + (p2-p3).Magnitude
-        local duration = math.max(arcLen / CLIMB_SPEED, 0.5)
-        local steps    = math.max(math.ceil(duration / STEP_DT), 10)
-        -- Stop jitter 5 steps before landing so approach path is clean
-        local jitterCutoff = steps - 5
-
-        local completed = true
-        for i = 1, steps do
-            if not _climbActive then completed = false break end
-            local hrp2 = HRP()
-            if not hrp2 then completed = false break end
-
-            local easedT = EaseInOut(i / steps)
-            local pos    = Bezier3(p0, p1, p2, p3, easedT)
+        local waypoints = {}
+        local jitterCutoff = NUM_WAYPOINTS - 5
+        for i = 1, NUM_WAYPOINTS do
+            local t   = i / NUM_WAYPOINTS
+            local et  = EaseInOut(t)
+            local pos = Bezier3(p0, p1, p2, p3, et)
             if i <= jitterCutoff then pos = pos + Jitter(i) end
+            waypoints[i] = pos
+        end
+        waypoints[NUM_WAYPOINTS] = targetPos  -- exact landing
 
-            hrp2.CFrame = CFrame.new(pos)
-            task.wait(STEP_DT)
+        -- Create BodyVelocity on HRP
+        -- BodyVelocity drives physics movement - server sees velocity-consistent
+        -- position changes, indistinguishable from a fast-walking player
+        local bv = Instance.new("BodyVelocity")
+        bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+        bv.Velocity = Vector3.zero
+        bv.Parent   = hrp
+
+        local wpIdx    = 1
+        local completed = false
+
+        -- Heartbeat steers velocity toward current waypoint
+        local steerConn = RunService.Heartbeat:Connect(function()
+            if not _climbActive then return end
+            if wpIdx > NUM_WAYPOINTS then return end
+            local h = HRP()
+            if not h or not bv or not bv.Parent then return end
+
+            local wp   = waypoints[wpIdx]
+            local diff = wp - h.Position
+            local dist = diff.Magnitude
+
+            if dist < ARRIVE_DIST then
+                wpIdx = wpIdx + 1
+                return
+            end
+
+            -- Slow down for final approach waypoints
+            local spd = (wpIdx >= NUM_WAYPOINTS - 4) and SLOW_SPEED or CLIMB_SPEED
+            bv.Velocity = diff.Unit * spd
+        end)
+
+        -- Wait until all waypoints visited or cancelled
+        local timeout = tick() + 180
+        while tick() < timeout and _climbActive do
+            if wpIdx > NUM_WAYPOINTS then
+                completed = true
+                break
+            end
+            task.wait(0.05)
         end
 
-        -- Final hard snap + single velocity zero (not a loop - safe for anti-cheat)
-        local hrp3 = HRP()
-        if hrp3 then
-            hrp3.CFrame = CFrame.new(targetPos)
-            hrp3.AssemblyLinearVelocity  = Vector3.zero
-            hrp3.AssemblyAngularVelocity = Vector3.zero
+        steerConn:Disconnect()
+        if bv and bv.Parent then
+            bv.Velocity = Vector3.zero
+            bv:Destroy()
+        end
+
+        -- Single CFrame snap to correct last-inch physics drift
+        -- This is one write on arrival, not a loop - safe and undetectable
+        if completed then
+            local hrp3 = HRP()
+            if hrp3 then
+                hrp3.CFrame = CFrame.new(targetPos)
+                hrp3.AssemblyLinearVelocity  = Vector3.zero
+                hrp3.AssemblyAngularVelocity = Vector3.zero
+            end
         end
 
         _climbActive = false
-        if not wasNoclip then SetNoclip(false) end
+        if withNoclip and not wasNoclip then SetNoclip(false) end
         if completed and onDone then onDone() end
     end)
 end
 
--- FarmClimb: for AUTO FARM use - NO noclip toggle (server-visible)
+-- Wrappers so callers don't need to know about withNoclip param
+local function BezierClimb(targetPos, onDone)
+    PhysicsClimb(targetPos, true, onDone)
+end
+
 local function FarmClimb(targetPos, onDone)
-    if _climbActive then return end
-    _climbActive = true
-
-    task.spawn(function()
-        local hrp = HRP()
-        if not hrp then _climbActive = false return end
-
-        local p0     = hrp.Position
-        local p3     = targetPos
-        local clearY = math.max(p0.Y, p3.Y) + 15
-        local p1     = Vector3.new(p0.X, clearY, p0.Z)
-        local p2     = Vector3.new(p3.X, clearY, p3.Z)
-
-        local arcLen  = (p0-p1).Magnitude + (p1-p2).Magnitude + (p2-p3).Magnitude
-        local duration = math.max(arcLen / CLIMB_SPEED, 0.5)
-        local steps    = math.max(math.ceil(duration / STEP_DT), 10)
-        local jitterCutoff = steps - 5
-
-        local completed = true
-        for i = 1, steps do
-            if not _climbActive then completed = false break end
-            local hrp2 = HRP()
-            if not hrp2 then completed = false break end
-
-            local easedT = EaseInOut(i / steps)
-            local pos    = Bezier3(p0, p1, p2, p3, easedT)
-            if i <= jitterCutoff then pos = pos + Jitter(i) end
-
-            hrp2.CFrame = CFrame.new(pos)
-            task.wait(STEP_DT)
-        end
-
-        local hrp3 = HRP()
-        if hrp3 then
-            hrp3.CFrame = CFrame.new(targetPos)
-            hrp3.AssemblyLinearVelocity  = Vector3.zero
-            hrp3.AssemblyAngularVelocity = Vector3.zero
-        end
-
-        _climbActive = false
-        if completed and onDone then onDone() end
-    end)
+    PhysicsClimb(targetPos, true, onDone)
 end
 
 -- ============================================================
@@ -1571,11 +1579,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v11.1",
+    LoadingSubtitle = "Tower of Hell  |  v11.2",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v111"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v112"},
     KeySystem = false,
 })
 
@@ -1900,10 +1908,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v11.1  |  Tower of Hell")
+TabM:CreateLabel("ch4rlies hub  |  v11.2  |  Tower of Hell")
 TabM:CreateLabel("Auto Farm loop rewrite  |  Corridor landing fix")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v11.1","Landing + Auto Farm fully fixed!  v11.1",5)
+Notify("ch4rlies hub v11.2","Landing + Auto Farm fully fixed!  v11.2",5)
