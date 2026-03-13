@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.4
+-- ch4rlies hub | Tower of Hell | v10.5
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -60,6 +60,7 @@ local cfg = {
     Invisible   = false, Spin       = false,
     ClickTP     = false, ThirdPerson= false,
     AutoFarm    = false, FakeLag    = false,
+    InfZoom     = false,
     FakeLagMs   = 100,
     RainbowSpd  = 0.8,  SpinSpd    = 6,
     FOV         = 70,   ThirdDist  = 20,
@@ -741,10 +742,9 @@ end
 --
 -- The ease-in-out curve is applied to the t parameter so the
 -- whole motion accelerates, cruises, then decelerates smoothly.
--- Speed = 50 studs/sec (below ToH ban threshold).
--- Press the button again while climbing to cancel.
--- ============================================================
-local CLIMB_SPEED = 50  -- studs/sec - safe under ToH kick threshold
+-- Speed = 120 studs/sec for auto farm feel (safe, well under ToH ban threshold)
+-- Manual button still uses this same speed - feels fast and clean.
+local CLIMB_SPEED = 120  -- studs/sec
 
 local function EaseInOut(t)
     return t * t * (3 - 2 * t)
@@ -782,7 +782,7 @@ local function BezierClimb(targetPos, onDone)
         local p0 = hrp.Position
         local p3 = targetPos
 
-        local clearY = math.max(p0.Y, p3.Y) + 40
+        local clearY = math.max(p0.Y, p3.Y) + 12
         local p1 = Vector3.new(p0.X, clearY, p0.Z)
         local p2 = Vector3.new(p3.X, clearY, p3.Z)
 
@@ -948,6 +948,33 @@ local _origFOV = 70
 local function SetFOV(v)
     cfg.FOV = v
     Camera.FieldOfView = v
+end
+
+-- ============================================================
+-- INFINITE ZOOM
+-- Removes the max zoom cap so you can scroll out as far as
+-- you want. Re-enforced on Heartbeat so ToH can't reset it.
+-- ============================================================
+local function SetInfZoom(v)
+    cfg.InfZoom = v
+    Conn("infzoom")
+    if v then
+        LP.CameraMaxZoomDistance = 999999
+        LP.CameraMinZoomDistance = 0
+        _conns["infzoom"] = RunService.Heartbeat:Connect(function()
+            if LP.CameraMaxZoomDistance < 999999 then
+                LP.CameraMaxZoomDistance = 999999
+            end
+            if LP.CameraMinZoomDistance ~= 0 then
+                LP.CameraMinZoomDistance = 0
+            end
+        end)
+        Notify("ch4rlies hub","Infinite Zoom ON - scroll out freely!",3)
+    else
+        LP.CameraMaxZoomDistance = 400
+        LP.CameraMinZoomDistance = 0.5
+        Notify("ch4rlies hub","Infinite Zoom OFF",2)
+    end
 end
 
 -- ============================================================
@@ -1240,45 +1267,36 @@ LP.CharacterAdded:Connect(function(char)
     -- AUTO FARM: wait for the NEW tower to be fully generated,
     -- then call AutoComplete() - identical to pressing it manually.
     --
-    -- WHY NOT WaitForChild directly:
-    --   workspace.tower exists immediately (old tower still there).
-    --   WaitForChild would resolve instantly with the OLD tower,
-    --   and AutoComplete would target the OLD FinishGlow which
-    --   ToH is about to destroy, landing us in the void.
-    --
-    -- FIX: Wait for workspace.tower to be REMOVED first (confirms
-    --   old round is fully cleaned up), then WaitForChild for the
-    --   new one. This guarantees we are targeting the fresh tower.
+    -- Tower removal detection is pure-event-driven using a BindableEvent
+    -- as a one-shot signal. No polling loop = fires instantly the moment
+    -- ToH destroys workspace.tower, never waits the full timeout.
     if _autoFarmActive then
         task.spawn(function()
             -- Step 1: wait for the OLD tower to be removed
-            -- (ToH destroys workspace.tower between rounds)
             local oldTower = workspace:FindFirstChild("tower")
-            if oldTower then
-                -- Listen for it being removed, timeout 15s
-                local removed = false
-                local removeConn
-                removeConn = workspace.ChildRemoved:Connect(function(child)
+            if oldTower and oldTower.Parent then
+                -- Pure event-driven: BindableEvent fires the instant tower is removed
+                local sig  = Instance.new("BindableEvent")
+                local conn = workspace.ChildRemoved:Connect(function(child)
                     if child == oldTower then
-                        removed = true
-                        removeConn:Disconnect()
+                        sig:Fire()
                     end
                 end)
-                local waited = 0
-                while not removed and waited < 15 do
-                    if not _autoFarmActive then
-                        removeConn:Disconnect()
-                        return
-                    end
-                    task.wait(0.5)
-                    waited = waited + 0.5
+                -- Guard: if it was removed between FindFirstChild and Connect, fire now
+                if not workspace:FindFirstChild("tower") then
+                    sig:Fire()
+                else
+                    -- Timeout safety: fire after 20s no matter what
+                    task.delay(20, function() sig:Fire() end)
+                    sig.Event:Wait()
                 end
-                removeConn:Disconnect()
+                conn:Disconnect()
+                sig:Destroy()
             end
 
             if not _autoFarmActive then return end
 
-            -- Step 2: wait for the NEW tower and its FinishGlow
+            -- Step 2: event-driven wait for the NEW tower and its FinishGlow
             local ok = pcall(function()
                 local tower    = workspace:WaitForChild("tower",    30)
                 local sections = tower:WaitForChild("sections",     30)
@@ -1288,8 +1306,8 @@ LP.CharacterAdded:Connect(function(char)
 
             if not ok or not _autoFarmActive then return end
 
-            -- Step 3: small natural delay before climbing
-            task.wait(2)
+            -- Tiny settle delay (let the tower finish generating)
+            task.wait(0.3)
             if not _autoFarmActive then return end
 
             _autoFarmRounds = _autoFarmRounds + 1
@@ -1311,11 +1329,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.4",
+    LoadingSubtitle = "Tower of Hell  |  v10.5",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v104"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v105"},
     KeySystem = false,
 })
 
@@ -1366,6 +1384,9 @@ TabP:CreateSlider({Name="Fly Speed",Range={10,200},Increment=5,
     Callback=function(v) cfg.FlySpeed = v end})
 
 TabP:CreateSection("Camera")
+TabP:CreateToggle({Name="Infinite Zoom  (scroll out as far as you want)",
+    CurrentValue=false,Flag="InfZoom",
+    Callback=function(v) SetInfZoom(v) end})
 TabP:CreateSlider({Name="Field of View",Range={50,120},Increment=1,
     Suffix=" deg",CurrentValue=70,Flag="FOV",
     Callback=function(v) SetFOV(v) end})
@@ -1630,10 +1651,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.4  |  Tower of Hell")
-TabM:CreateLabel("Auto Farm respawn bug fixed  |  Fake Lag added")
+TabM:CreateLabel("ch4rlies hub  |  v10.5  |  Tower of Hell")
+TabM:CreateLabel("Auto Farm instant detection  |  Faster climb  |  Infinite Zoom")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.4","Auto Farm respawn bug fixed!",5)
+Notify("ch4rlies hub v10.5","Auto Farm faster + Infinite Zoom added!",5)
