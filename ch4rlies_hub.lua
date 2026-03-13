@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.8
+-- ch4rlies hub | Tower of Hell | v10.9
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -940,7 +940,12 @@ local function AutoComplete()
     end
 
     Notify("ch4rlies hub","Climbing to: "..label.."  (press again to cancel)",4)
+    -- Force God Mode on for the climb so lasers/kill parts can't end it.
+    -- Restores to whatever the user had it set to when done.
+    local hadGod = cfg.GodMode
+    if not hadGod then SetGodMode(true) end
     BezierClimb(target, function()
+        if not hadGod then SetGodMode(false) end
         RestoreForCoins()
         Notify("ch4rlies hub","Reached the finish! Coins awarded.",4)
     end)
@@ -990,7 +995,10 @@ local function SkipSection()
 
     local target = next.pos + Vector3.new(0, 3.5, 0)
     Notify("ch4rlies hub","Skipping to: "..next.name.."  (press again to cancel)",3)
+    local hadGod = cfg.GodMode
+    if not hadGod then SetGodMode(true) end
     BezierClimb(target, function()
+        if not hadGod then SetGodMode(false) end
         Notify("ch4rlies hub","Landed on: "..next.name,2)
     end)
 end
@@ -1492,7 +1500,11 @@ LP.CharacterAdded:Connect(function(char)
                 "Auto Farm: Round ".._autoFarmRounds.." - climbing...", 3)
 
             -- FarmClimb: no noclip toggle, no velocity zeroing, jittered path
+            -- God Mode enabled for duration so lasers don't kill mid-climb
+            local hadGod = cfg.GodMode
+            if not hadGod then SetGodMode(true) end
             FarmClimb(target, function()
+                if not hadGod then SetGodMode(false) end
                 RestoreForCoins()
                 Notify("ch4rlies hub",
                     "Auto Farm: Round ".._autoFarmRounds.." complete!", 3)
@@ -1512,11 +1524,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.8",
+    LoadingSubtitle = "Tower of Hell  |  v10.9",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v108"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v109"},
     KeySystem = false,
 })
 
@@ -1841,10 +1853,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.8  |  Tower of Hell")
+TabM:CreateLabel("ch4rlies hub  |  v10.9  |  Tower of Hell")
 TabM:CreateLabel("Auto Farm instant detection  |  Faster climb  |  Infinite Zoom")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.8","Auto Farm fixed!  v10.8",5)
+Notify("ch4rlies hub v10.9","Auto Farm fixed!  v10.9",5)
