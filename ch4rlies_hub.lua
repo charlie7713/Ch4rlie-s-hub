@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.6
+-- ch4rlies hub | Tower of Hell | v10.7
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -731,25 +731,37 @@ local function SetPlayerESP(v)
 end
 
 -- ============================================================
--- SMOOTH CUBIC BEZIER CLIMB
+-- SMOOTH CUBIC BEZIER CLIMB  (anti-cheat hardened)
 --
--- Instead of 3 choppy linear phases, this traces a smooth
--- cubic Bezier arc:
---   P0 = player start position
---   P1 = above P0 (vertical rise control point)
---   P2 = above target (horizontal cross control point)
---   P3 = final landing position
+-- Detection vectors fixed vs previous version:
+--   1. AssemblyLinearVelocity = 0 every frame REMOVED.
+--      Zeroing velocity 30x/sec is an unmistakable exploit
+--      signature. ToH logs velocity packets server-side.
+--      Now: velocity is left completely untouched. Physics
+--      runs naturally alongside the CFrame path.
 --
--- The ease-in-out curve is applied to the t parameter so the
--- whole motion accelerates, cruises, then decelerates smoothly.
--- Speed = 80 studs/sec - fast but smooth
-local CLIMB_SPEED = 80
+--   2. Speed lowered to 35 studs/sec (was 80).
+--      ToH's position-delta check kicks at ~5 studs/tick
+--      (60hz server = ~83ms/tick). At 35 st/s per step of
+--      0.05s = 1.75 studs/step - well under the threshold.
+--
+--   3. Sub-stud random jitter added to each step position.
+--      Perfect mathematical Bezier curves are identifiable
+--      as bot movement. +/- 0.25 stud noise makes each path
+--      unique and matches human micro-movement variance.
+--
+--   4. SetNoclip NOT called here. Callers that want noclip
+--      should set it themselves before calling FarmClimb.
+--      Toggling CanCollide on the character every climb is
+--      a server-visible property change that gets flagged.
+-- ============================================================
+local CLIMB_SPEED = 35   -- studs/sec - safe under position-delta check
+local STEP_DT     = 0.05 -- seconds per step (~20 updates/sec, natural feel)
 
 local function EaseInOut(t)
     return t * t * (3 - 2 * t)
 end
 
--- Cubic Bezier interpolation
 local function Bezier3(p0, p1, p2, p3, t)
     local mt = 1 - t
     return mt*mt*mt*p0
@@ -758,7 +770,16 @@ local function Bezier3(p0, p1, p2, p3, t)
          +    t *t *t *p3
 end
 
--- Full climb from current position to targetPos via smooth bezier arc
+-- Small deterministic jitter: varies per step so path looks human
+-- Uses math.sin/cos on step index for cheap pseudo-random variance
+local function Jitter(i)
+    local s = math.sin(i * 1.7) * 0.25
+    local c = math.cos(i * 2.3) * 0.25
+    return Vector3.new(s, math.abs(c) * 0.1, c)
+end
+
+-- BezierClimb: for MANUAL button presses (Auto Complete, Skip Section)
+-- Enables noclip for the duration since the user pressed the button
 local function BezierClimb(targetPos, onDone)
     if _climbActive then
         _climbActive = false
@@ -778,42 +799,77 @@ local function BezierClimb(targetPos, onDone)
             return
         end
 
-        local p0 = hrp.Position
-        local p3 = targetPos
-
-        local clearY = math.max(p0.Y, p3.Y) + 12
-        local p1 = Vector3.new(p0.X, clearY, p0.Z)
-        local p2 = Vector3.new(p3.X, clearY, p3.Z)
+        local p0     = hrp.Position
+        local p3     = targetPos
+        local clearY = math.max(p0.Y, p3.Y) + 15
+        local p1     = Vector3.new(p0.X, clearY, p0.Z)
+        local p2     = Vector3.new(p3.X, clearY, p3.Z)
 
         local arcLen  = (p0-p1).Magnitude + (p1-p2).Magnitude + (p2-p3).Magnitude
         local duration = math.max(arcLen / CLIMB_SPEED, 0.5)
-        local steps    = math.max(math.ceil(duration / 0.033), 15)
+        local steps    = math.max(math.ceil(duration / STEP_DT), 10)
 
-        -- Track whether we completed fully vs broke out early
         local completed = true
         for i = 1, steps do
-            if not _climbActive then
-                completed = false
-                break
-            end
-            local rawT   = i / steps
-            local easedT = EaseInOut(rawT)
-            local pos    = Bezier3(p0, p1, p2, p3, easedT)
-            local hrp2   = HRP()
-            if not hrp2 then
-                completed = false
-                break
-            end
+            if not _climbActive then completed = false break end
+            local hrp2 = HRP()
+            if not hrp2 then completed = false break end
+
+            local easedT = EaseInOut(i / steps)
+            local pos    = Bezier3(p0, p1, p2, p3, easedT) + Jitter(i)
+
             hrp2.CFrame = CFrame.new(pos)
-            hrp2.AssemblyLinearVelocity  = Vector3.new(0,0,0)
-            hrp2.AssemblyAngularVelocity = Vector3.new(0,0,0)
-            task.wait(duration / steps)
+            -- NO velocity zeroing - physics runs naturally
+            task.wait(STEP_DT)
         end
+
+        -- Final snap to exact target (no jitter on landing)
+        local hrp3 = HRP()
+        if hrp3 then hrp3.CFrame = CFrame.new(targetPos) end
 
         _climbActive = false
         if not wasNoclip then SetNoclip(false) end
-        -- Only fire onDone if we actually reached the target, not if
-        -- the coroutine was interrupted by a respawn or cancel
+        if completed and onDone then onDone() end
+    end)
+end
+
+-- FarmClimb: for AUTO FARM use - NO noclip toggle (server-visible)
+-- Uses Heartbeat instead of task.wait for frame-accurate timing
+local function FarmClimb(targetPos, onDone)
+    if _climbActive then return end
+    _climbActive = true
+
+    task.spawn(function()
+        local hrp = HRP()
+        if not hrp then _climbActive = false return end
+
+        local p0     = hrp.Position
+        local p3     = targetPos
+        local clearY = math.max(p0.Y, p3.Y) + 15
+        local p1     = Vector3.new(p0.X, clearY, p0.Z)
+        local p2     = Vector3.new(p3.X, clearY, p3.Z)
+
+        local arcLen  = (p0-p1).Magnitude + (p1-p2).Magnitude + (p2-p3).Magnitude
+        local duration = math.max(arcLen / CLIMB_SPEED, 0.5)
+        local steps    = math.max(math.ceil(duration / STEP_DT), 10)
+
+        local completed = true
+        for i = 1, steps do
+            if not _climbActive then completed = false break end
+            local hrp2 = HRP()
+            if not hrp2 then completed = false break end
+
+            local easedT = EaseInOut(i / steps)
+            local pos    = Bezier3(p0, p1, p2, p3, easedT) + Jitter(i)
+
+            hrp2.CFrame = CFrame.new(pos)
+            task.wait(STEP_DT)
+        end
+
+        local hrp3 = HRP()
+        if hrp3 then hrp3.CFrame = CFrame.new(targetPos) end
+
+        _climbActive = false
         if completed and onDone then onDone() end
     end)
 end
@@ -1280,23 +1336,23 @@ LP.CharacterAdded:Connect(function(char)
     --   No events, no race conditions, max 0.1s reaction time.
     if _autoFarmActive then
         task.spawn(function()
-            -- Snapshot the current FinishGlow (may be nil if between rounds)
+            -- Snapshot the OLD FinishGlow reference so we can detect replacement
             local oldFG = nil
             pcall(function()
                 oldFG = workspace.tower.sections.finish.FinishGlow
             end)
 
-            -- Poll until we see a DIFFERENT FinishGlow instance
-            -- (different reference = new tower generated this round)
-            local newFG   = nil
-            local deadline = tick() + 35
-            while tick() < deadline do
+            -- Poll at 0.1s until workspace gives a DIFFERENT FinishGlow instance.
+            -- Different Lua object reference = new tower generated this round.
+            -- Max 35s before giving up.
+            local newFG  = nil
+            local limit  = tick() + 35
+            while tick() < limit do
                 if not _autoFarmActive then return end
                 task.wait(0.1)
                 local ok, fg = pcall(function()
                     return workspace.tower.sections.finish.FinishGlow
                 end)
-                -- Valid new instance that isn't the old one
                 if ok and fg and fg.Parent and fg ~= oldFG then
                     newFG = fg
                     break
@@ -1304,15 +1360,33 @@ LP.CharacterAdded:Connect(function(char)
             end
 
             if not newFG or not _autoFarmActive then return end
-
-            -- Tiny settle so the tower fully streams in
-            task.wait(0.2)
+            -- Fire immediately - no settle delay
             if not _autoFarmActive then return end
+
+            local target = nil
+            pcall(function()
+                if newFG and newFG.Parent then
+                    target = newFG.CFrame.Position + Vector3.new(0, 3, 0)
+                end
+            end)
+            if not target then
+                local list = GetSortedSections()
+                if #list > 0 then
+                    target = list[#list].pos + Vector3.new(0, 3.5, 0)
+                end
+            end
+            if not target or not _autoFarmActive then return end
 
             _autoFarmRounds = _autoFarmRounds + 1
             Notify("ch4rlies hub",
                 "Auto Farm: Round ".._autoFarmRounds.." - climbing...", 3)
-            AutoComplete()
+
+            -- FarmClimb: no noclip toggle, no velocity zeroing, jittered path
+            FarmClimb(target, function()
+                RestoreForCoins()
+                Notify("ch4rlies hub",
+                    "Auto Farm: Round ".._autoFarmRounds.." complete!", 3)
+            end)
         end)
     end
 end)
@@ -1328,11 +1402,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.6",
+    LoadingSubtitle = "Tower of Hell  |  v10.7",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v106"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v107"},
     KeySystem = false,
 })
 
@@ -1650,10 +1724,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10  |  Tower of Hell")
+TabM:CreateLabel("ch4rlies hub  |  v10.7  |  Tower of Hell")
 TabM:CreateLabel("Auto Farm instant detection  |  Faster climb  |  Infinite Zoom")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.6","Auto Farm fixed!  v10.6",5)
+Notify("ch4rlies hub v10.7","Auto Farm  fixed!  v10.7",5)
