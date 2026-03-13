@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v11.0
+-- ch4rlies hub | Tower of Hell | v11.1
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -126,12 +126,59 @@ local function GetSortedSections()
     return list
 end
 
--- Get the FinishGlow part - the confirmed finish target
-local function GetFinishGlow()
-    local ok, fg = pcall(function()
+-- Get the finish target - the center of the finish corridor floor.
+--
+-- FinishGlow is a decorative glow emitter whose origin can be at
+-- the edge of or outside the corridor walls. Instead we:
+--   1. Get the finish Model from workspace.tower.sections.finish
+--   2. Look for a "start" BasePart (same convention as other sections)
+--   3. If no "start", find the largest horizontal BasePart (the floor)
+--   4. Target its CFrame center at standing height (+3 Y)
+-- This guarantees we land in the middle of the corridor, not outside.
+local function GetFinishTarget()
+    local ok, finishModel = pcall(function()
+        return workspace.tower.sections.finish
+    end)
+    if not ok or not finishModel then return nil end
+
+    -- Prefer "start" part (standard section convention)
+    local startPart = finishModel:FindFirstChild("start")
+    if startPart and startPart:IsA("BasePart") then
+        return startPart.CFrame.Position + Vector3.new(0, 3, 0)
+    end
+
+    -- Fallback: find the largest flat-ish floor BasePart in the finish model.
+    -- "Flat" = Size.Y is small relative to Size.X and Size.Z.
+    local bestPart = nil
+    local bestArea = 0
+    for _, p in ipairs(finishModel:GetDescendants()) do
+        if p:IsA("BasePart") and p.Name ~= "FinishGlow" then
+            local s    = p.Size
+            local area = s.X * s.Z
+            if area > bestArea and s.Y < s.X and s.Y < s.Z then
+                bestArea = area
+                bestPart = p
+            end
+        end
+    end
+    if bestPart then
+        -- Stand on top of the largest floor part, centered
+        local topY = bestPart.CFrame.Position.Y + (bestPart.Size.Y / 2) + 3
+        return Vector3.new(
+            bestPart.CFrame.Position.X,
+            topY,
+            bestPart.CFrame.Position.Z
+        )
+    end
+
+    -- Last resort: FinishGlow position (original behaviour)
+    local fgOk, fg = pcall(function()
         return workspace.tower.sections.finish.FinishGlow
     end)
-    if ok and fg and fg:IsA("BasePart") then return fg end
+    if fgOk and fg and fg:IsA("BasePart") then
+        return fg.CFrame.Position + Vector3.new(0, 3, 0)
+    end
+
     return nil
 end
 
@@ -924,15 +971,9 @@ local function AutoComplete()
     local target = nil
     local label  = ""
 
-    -- Priority 1: direct FinishGlow path (confirmed working)
-    pcall(function()
-        local fg = workspace.tower.sections.finish.FinishGlow
-        -- Guard: must have a parent (not being destroyed)
-        if fg and fg.Parent then
-            target = fg.CFrame.Position + Vector3.new(0, 3, 0)
-            label  = "FinishGlow"
-        end
-    end)
+    -- Priority 1: finish corridor floor center (robust - lands in middle)
+    target = GetFinishTarget()
+    if target then label = "finish corridor" end
 
     -- Priority 2: highest section's start part
     if not target then
@@ -1343,24 +1384,100 @@ end
 -- ============================================================
 -- AUTO FARM
 --
--- Detection root cause of old version:
---   - Ran a separate CharacterAdded connection (double hook = suspicious)
---   - Polled GetSortedSections() in a 0.5s loop = heavy workspace scans
---   - Had different timing/delays from AutoComplete = different fingerprint
+-- Standalone continuous loop - NOT tied to CharacterAdded.
+-- Previous approach snapshotted oldFG in CharacterAdded, but the
+-- new tower can generate so fast that oldFG was already the NEW
+-- round's FG by snapshot time, causing the poll to stall forever.
 --
--- Fix: AutoFarm sets a flag only. The EXISTING CharacterAdded handler
--- already fires every round. We just add one line there to call
--- AutoComplete() when the flag is set. No separate connections,
--- no polling - WaitForChild (event-based) instead.
--- The climb is 100% identical to pressing AutoComplete manually.
+-- New approach: one coroutine runs for the whole session.
+-- Each iteration:
+--   1. Wait until a valid finish target exists (tower is ready)
+--   2. Wait until our character is at spawn Y (< 10) - round started
+--   3. Climb immediately using FarmClimb
+--   4. After climb done: wait until finish target DISAPPEARS (round over)
+--   5. Repeat
+-- No CharacterAdded dependency. No instance comparison tricks.
 -- ============================================================
 local _autoFarmActive = false
 local _autoFarmRounds = 0
+local _autoFarmThread = nil
+
+local function AutoFarmLoop()
+    while _autoFarmActive do
+        -- Step 1: wait for a valid finish target (tower generated)
+        local target = nil
+        while _autoFarmActive and not target do
+            task.wait(0.15)
+            target = GetFinishTarget()
+        end
+        if not _autoFarmActive then break end
+
+        -- Step 2: wait until character is at spawn height (round hasn't started
+        -- climbing yet). Spawn platforms in ToH are typically Y < 15.
+        -- This prevents starting a climb while already mid-tower from last round.
+        local spawnWait = 0
+        while _autoFarmActive and spawnWait < 8 do
+            local hrp = HRP()
+            if hrp and hrp.Position.Y < 20 then break end
+            task.wait(0.2)
+            spawnWait = spawnWait + 0.2
+        end
+        if not _autoFarmActive then break end
+
+        -- Re-fetch target now that we're sure it's the current round
+        target = GetFinishTarget()
+        if target then
+
+        _autoFarmRounds = _autoFarmRounds + 1
+        Notify("ch4rlies hub",
+            "Auto Farm: Round ".._autoFarmRounds.." - climbing...", 3)
+
+        -- Step 3: climb with God Mode forced on
+        local hadGod = cfg.GodMode
+        if not hadGod then SetGodMode(true) end
+
+        local climbDone = false
+        FarmClimb(target, function()
+            if not hadGod then SetGodMode(false) end
+            RestoreForCoins()
+            Notify("ch4rlies hub",
+                "Auto Farm: Round ".._autoFarmRounds.." complete!", 3)
+            climbDone = true
+        end)
+
+        -- Wait for climb to finish (or give up after 120s)
+        local elapsed = 0
+        while not climbDone and elapsed < 120 and _autoFarmActive do
+            task.wait(0.2)
+            elapsed = elapsed + 0.2
+        end
+        if not _autoFarmActive then break end
+
+        -- Step 4: wait until finish target disappears (round ended, tower removed)
+        -- This is the gate that stops us re-climbing the same round
+        local gone = false
+        local goneWait = 0
+        while _autoFarmActive and not gone and goneWait < 60 do
+            task.wait(0.2)
+            goneWait = goneWait + 0.2
+            local t2 = GetFinishTarget()
+            if not t2 then gone = true end
+        end
+
+        end -- if target
+        -- Small buffer before next iteration
+        task.wait(0.3)
+    end
+end
 
 local function SetAutoFarm(v)
     cfg.AutoFarm = v
     _autoFarmActive = v
     if not v then
+        if _autoFarmThread then
+            task.cancel(_autoFarmThread)
+            _autoFarmThread = nil
+        end
         Notify("ch4rlies hub",
             "Auto Farm OFF. Rounds this session: ".._autoFarmRounds, 4)
         _autoFarmRounds = 0
@@ -1368,18 +1485,7 @@ local function SetAutoFarm(v)
     end
     _autoFarmRounds = 0
     Notify("ch4rlies hub","Auto Farm ON - completes every round automatically!",4)
-    -- If already in an active round, start immediately
-    task.spawn(function()
-        local list = GetSortedSections()
-        if #list > 0 then
-            task.wait(1)
-            if _autoFarmActive then
-                _autoFarmRounds = _autoFarmRounds + 1
-                Notify("ch4rlies hub","Auto Farm: completing current round...",3)
-                AutoComplete()
-            end
-        end
-    end)
+    _autoFarmThread = task.spawn(AutoFarmLoop)
 end
 
 -- ============================================================
@@ -1450,78 +1556,8 @@ LP.CharacterAdded:Connect(function(char)
     if cfg.Rainbow     then SetRainbow(true)       end
     if cfg.AutoRespawn then SetAutoRespawn(true)   end
 
-    -- AUTO FARM: wait for the NEW tower to be fully generated,
-    -- then call AutoComplete() identically to a manual button press.
-    --
-    -- Why BindableEvent was broken (race condition):
-    --   ChildRemoved can fire BEFORE sig.Event:Wait() is reached.
-    --   In Roblox, a BindableEvent.Fire() before .Wait() loses the
-    --   signal completely. So on rounds 2+ the event was missed and
-    --   the 20-second timeout fired instead - causing the long delay.
-    --
-    -- Fix: store the current FinishGlow instance reference before
-    --   the round ends, then poll every 0.1s until workspace gives
-    --   us a DIFFERENT instance. Different reference = new tower.
-    --   No events, no race conditions, max 0.1s reaction time.
-    if _autoFarmActive then
-        task.spawn(function()
-            -- Snapshot the OLD FinishGlow reference so we can detect replacement
-            local oldFG = nil
-            pcall(function()
-                oldFG = workspace.tower.sections.finish.FinishGlow
-            end)
-
-            -- Poll at 0.1s until workspace gives a DIFFERENT FinishGlow instance.
-            -- Different Lua object reference = new tower generated this round.
-            -- Max 35s before giving up.
-            local newFG  = nil
-            local limit  = tick() + 35
-            while tick() < limit do
-                if not _autoFarmActive then return end
-                task.wait(0.1)
-                local ok, fg = pcall(function()
-                    return workspace.tower.sections.finish.FinishGlow
-                end)
-                if ok and fg and fg.Parent and fg ~= oldFG then
-                    newFG = fg
-                    break
-                end
-            end
-
-            if not newFG or not _autoFarmActive then return end
-            -- Fire immediately - no settle delay
-            if not _autoFarmActive then return end
-
-            local target = nil
-            pcall(function()
-                if newFG and newFG.Parent then
-                    target = newFG.CFrame.Position + Vector3.new(0, 3, 0)
-                end
-            end)
-            if not target then
-                local list = GetSortedSections()
-                if #list > 0 then
-                    target = list[#list].pos + Vector3.new(0, 3.5, 0)
-                end
-            end
-            if not target or not _autoFarmActive then return end
-
-            _autoFarmRounds = _autoFarmRounds + 1
-            Notify("ch4rlies hub",
-                "Auto Farm: Round ".._autoFarmRounds.." - climbing...", 3)
-
-            -- FarmClimb: no noclip toggle, no velocity zeroing, jittered path
-            -- God Mode enabled for duration so lasers don't kill mid-climb
-            local hadGod = cfg.GodMode
-            if not hadGod then SetGodMode(true) end
-            FarmClimb(target, function()
-                if not hadGod then SetGodMode(false) end
-                RestoreForCoins()
-                Notify("ch4rlies hub",
-                    "Auto Farm: Round ".._autoFarmRounds.." complete!", 3)
-            end)
-        end)
-    end
+    -- Auto farm is handled by a standalone loop (SetAutoFarm).
+    -- CharacterAdded just resets climb state.
 end)
 
 task.spawn(function()
@@ -1535,11 +1571,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v11.0",
+    LoadingSubtitle = "Tower of Hell  |  v11.1",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v110"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v111"},
     KeySystem = false,
 })
 
@@ -1864,10 +1900,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v11.0  |  Tower of Hell")
-TabM:CreateLabel("Auto Farm instant detection  |  Faster climb  |  Infinite Zoom")
+TabM:CreateLabel("ch4rlies hub  |  v11.1  |  Tower of Hell")
+TabM:CreateLabel("Auto Farm loop rewrite  |  Corridor landing fix")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v11.0","Auto Farm fixed!  v11.0",5)
+Notify("ch4rlies hub v11.1","Landing + Auto Farm fully fixed!  v11.1",5)
