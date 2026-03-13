@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.7
+-- ch4rlies hub | Tower of Hell | v10.8
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -60,7 +60,7 @@ local cfg = {
     Invisible   = false, Spin       = false,
     ClickTP     = false, ThirdPerson= false,
     AutoFarm    = false, FakeLag    = false,
-    InfZoom     = false,
+    InfZoom     = false, Grapple    = false,
     FakeLagMs   = 100,
     RainbowSpd  = 0.8,  SpinSpd    = 6,
     FOV         = 70,   ThirdDist  = 20,
@@ -307,24 +307,25 @@ local function SetNoclip(v)
 end
 
 -- ============================================================
--- GOD MODE (reworked - no per-frame health writes)
+-- GOD MODE (v3 - physics-safe)
 --
--- Previous version wrote health every RenderStepped frame which
--- fought Roblox's character state machine and caused animation
--- glitches (stuck poses, physics spazzing). Fixed approach:
+-- Root cause of bouncy/can't-climb bug in previous versions:
+--   The Heartbeat loop called p.CanTouch = false every frame
+--   on every kill part. In ToH, kill parts are embedded inside
+--   moving obstacle models. Setting CanTouch mid-frame while
+--   Roblox is computing physics for those models ejects the
+--   character and breaks climbing. Completely removed.
 --
---  Layer 1: CanTouch=false on kill-named parts (Heartbeat re-enforce)
---  Layer 2: __namecall hook blocks TakeDamage + Kick (InstallHooks)
---  Layer 3: __newindex hook drops Health writes below 50% MaxHealth
---  Layer 4: HealthChanged event - reactive, debounced restore
---           Only fires when health actually changes. Debounced
---           so it never writes more than once per 0.1s, preventing
---           the feedback loop that causes character glitches.
---  Layer 5: Died event - safe pos restore with proper timing
---           Waits for character to fully respawn before restoring.
+-- New approach - hooks are the PRIMARY defense:
+--   Layer 1: __namecall hook blocks TakeDamage calls entirely
+--   Layer 2: __newindex hook drops Health writes below 80% max
+--   Layer 3: CanTouch=false on kill parts ONCE on enable only
+--            (+ DescendantAdded for new parts). No loop.
+--   Layer 4: HealthChanged debounced restore (0.25s cooldown)
+--   Layer 5: Died handler - safe pos restore after 0.2s settle
 --
--- RenderStepped is ONLY used to track safe position now.
--- Health is NEVER written on a loop - only reactively.
+-- RenderStepped only used to track last safe position.
+-- No Heartbeat health or CanTouch writes at all.
 -- ============================================================
 local _godHealCooldown = false
 
@@ -332,46 +333,47 @@ local function RestoreHealth()
     if _godHealCooldown then return end
     _godHealCooldown = true
     task.spawn(function()
-        task.wait(0.08)
+        task.wait(0.25)  -- longer debounce = no rapid health write feedback loop
         local h = Hum()
-        if h and cfg.GodMode then
+        if h and cfg.GodMode and h.Health < h.MaxHealth then
             pcall(function() h.Health = h.MaxHealth end)
         end
-        task.wait(0.02)
         _godHealCooldown = false
     end)
 end
 
 local function SetGodMode(v)
     cfg.GodMode = v
-    Conn("god_scan") Conn("god_hb") Conn("god_rs") Conn("god_hc") Conn("god_died")
+    Conn("god_scan") Conn("god_rs") Conn("god_hc") Conn("god_died")
+    -- Explicitly disconnect the old Heartbeat loop if it exists
+    Conn("god_hb")
     _godHealCooldown = false
 
     if v then
         InstallHooks()
         DisableKillScript()
 
-        -- Layer 1: disable touch on all existing kill parts
+        -- Layer 3: CanTouch=false ONCE on all current kill parts
+        -- No Heartbeat re-enforcement - that was causing the physics glitch
         for _, obj in ipairs(workspace:GetDescendants()) do
             if IsKillPart(obj) then
-                pcall(function() obj.CanTouch = false _killCache[obj] = true end)
+                pcall(function()
+                    obj.CanTouch = false
+                    _killCache[obj] = true
+                end)
             end
         end
-        -- Layer 1: catch newly added kill parts
+        -- Catch newly streamed-in kill parts
         _conns["god_scan"] = workspace.DescendantAdded:Connect(function(obj)
-            if IsKillPart(obj) then
-                pcall(function() obj.CanTouch = false _killCache[obj] = true end)
-            end
-        end)
-        -- Layer 1: re-enforce CanTouch=false (servers can reset it)
-        _conns["god_hb"] = RunService.Heartbeat:Connect(function()
-            for p,_ in pairs(_killCache) do
-                if p and p.Parent then pcall(function() p.CanTouch = false end)
-                else _killCache[p] = nil end
+            if cfg.GodMode and IsKillPart(obj) then
+                pcall(function()
+                    obj.CanTouch = false
+                    _killCache[obj] = true
+                end)
             end
         end)
 
-        -- RenderStepped: ONLY track safe position, no health writes
+        -- Track safe position only (no health writes here)
         _conns["god_rs"] = RunService.RenderStepped:Connect(function()
             local hrp = HRP()
             if hrp and hrp.Position.Y > -30 then
@@ -379,30 +381,25 @@ local function SetGodMode(v)
             end
         end)
 
-        -- Layer 4: reactive HealthChanged hook (debounced)
         local function HookHealth(char)
             local h = char and char:FindFirstChildOfClass("Humanoid")
             if not h then return end
             Conn("god_hc")
             _conns["god_hc"] = h.HealthChanged:Connect(function(hp)
                 if not cfg.GodMode then return end
-                if hp < h.MaxHealth and hp > 0 then
+                -- Only react if health dropped meaningfully (not tiny regen ticks)
+                if hp < h.MaxHealth * 0.8 and hp > 0 then
                     RestoreHealth()
                 end
             end)
-            -- Layer 5: Died handler
             Conn("god_died")
             _conns["god_died"] = h.Died:Connect(function()
                 if not cfg.GodMode then return end
-                -- Wait for character to be in a stable state before restoring
-                task.wait(0.15)
+                task.wait(0.2)
                 local h2   = Hum()
                 local hrp2 = HRP()
                 if not h2 or not hrp2 then return end
-                -- Only teleport back if we have a safe position stored
-                if _godSafePos then
-                    hrp2.CFrame = _godSafePos
-                end
+                if _godSafePos then hrp2.CFrame = _godSafePos end
                 task.wait(0.05)
                 pcall(function() h2.Health = h2.MaxHealth end)
             end)
@@ -1073,6 +1070,119 @@ local function SetSpin(v)
 end
 
 -- ============================================================
+-- GRAPPLE HOOK (ToH special feature)
+--
+-- Press E to fire a grapple to wherever your cursor is pointing.
+-- A visible rope beam draws from your HRP to the hit point.
+-- You smoothly pull toward it over 0.6 seconds. Perfect for
+-- skipping gaps between platforms in Tower of Hell.
+--
+-- Press E again while grappling to cancel mid-flight.
+-- Works through walls (noclip not required).
+-- ============================================================
+local _grappleActive = false
+local _grappleBeam   = nil
+local _grappleA0     = nil
+local _grappleA1     = nil
+
+local function ClearGrappleVisual()
+    if _grappleBeam  then pcall(function() _grappleBeam:Destroy()  end) _grappleBeam  = nil end
+    if _grappleA0    then pcall(function() _grappleA0:Destroy()    end) _grappleA0    = nil end
+    if _grappleA1    then pcall(function() _grappleA1:Destroy()    end) _grappleA1    = nil end
+end
+
+local function SetGrapple(v)
+    cfg.Grapple = v
+    Conn("grapple_key")
+    ClearGrappleVisual()
+    _grappleActive = false
+
+    if not v then
+        Notify("ch4rlies hub","Grapple Hook OFF",2)
+        return
+    end
+    Notify("ch4rlies hub","Grapple Hook ON  |  Press E to fire",3)
+
+    _conns["grapple_key"] = UserInputService.InputBegan:Connect(function(inp, gp)
+        if gp then return end
+        if inp.KeyCode ~= Enum.KeyCode.E then return end
+        if not cfg.Grapple then return end
+
+        -- Cancel if already grappling
+        if _grappleActive then
+            _grappleActive = false
+            ClearGrappleVisual()
+            Notify("ch4rlies hub","Grapple cancelled",2)
+            return
+        end
+
+        local hrp = HRP()
+        if not hrp then return end
+
+        -- Raycast from camera to cursor (long range)
+        local mouse = UserInputService:GetMouseLocation()
+        local ray   = Camera:ScreenPointToRay(mouse.X, mouse.Y)
+        local rp    = RaycastParams.new()
+        rp.FilterDescendantsInstances = {LP.Character}
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        local result = workspace:Raycast(ray.Origin, ray.Direction * 800, rp)
+        if not result then
+            Notify("ch4rlies hub","Grapple: no surface in range",2)
+            return
+        end
+
+        local hitPos = result.Position + Vector3.new(0, 2.5, 0)
+        _grappleActive = true
+
+        -- Draw the rope beam
+        ClearGrappleVisual()
+        local a0 = Instance.new("Attachment")
+        local a1 = Instance.new("Attachment")
+        a0.Parent = hrp
+        a1.WorldPosition = hitPos
+        a1.Parent = workspace.Terrain
+        local beam = Instance.new("Beam")
+        beam.Attachment0  = a0
+        beam.Attachment1  = a1
+        beam.Width0       = 0.08
+        beam.Width1       = 0.08
+        beam.Color        = ColorSequence.new(Color3.fromRGB(255, 220, 50))
+        beam.LightEmission = 0.6
+        beam.FaceCamera   = true
+        beam.Segments     = 8
+        beam.CurveSize0   = 0
+        beam.CurveSize1   = 0
+        beam.Parent       = hrp
+        _grappleBeam = beam
+        _grappleA0   = a0
+        _grappleA1   = a1
+
+        -- Pull toward hit point over 0.6 seconds
+        task.spawn(function()
+            local startPos = hrp.Position
+            local steps    = 20
+            local dt       = 0.03
+            for i = 1, steps do
+                if not _grappleActive then break end
+                local hrp2 = HRP()
+                if not hrp2 then break end
+                local t   = i / steps
+                local et  = t * t * (3 - 2 * t)  -- ease-in-out
+                local pos = startPos:Lerp(hitPos, et)
+                hrp2.CFrame = CFrame.new(pos)
+                -- Update rope A0 attachment trails the character
+                if a0 and a0.Parent then
+                    a0.WorldPosition = hrp2.Position
+                end
+                task.wait(dt)
+            end
+            _grappleActive = false
+            ClearGrappleVisual()
+        end)
+    end)
+end
+
+-- ============================================================
 -- CLICK TELEPORT
 -- Click any surface in the world to teleport there
 -- ============================================================
@@ -1402,11 +1512,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.7",
+    LoadingSubtitle = "Tower of Hell  |  v10.8",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v107"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v108"},
     KeySystem = false,
 })
 
@@ -1656,6 +1766,13 @@ TabV:CreateSlider({Name="Spin Speed",Range={1,20},Increment=1,
     Suffix="x",CurrentValue=6,Flag="SpinSpd",
     Callback=function(v) cfg.SpinSpd = v end})
 
+TabV:CreateSection("Grapple Hook  (Tower of Hell)")
+TabV:CreateLabel("Aim at any surface and press E to grapple.")
+TabV:CreateLabel("Press E again mid-flight to cancel.")
+TabV:CreateLabel("Perfect for skipping gaps between platforms.")
+TabV:CreateToggle({Name="Grapple Hook  [E key]",CurrentValue=false,Flag="Grapple",
+    Callback=function(v) SetGrapple(v) end})
+
 -- MISC TAB
 local TabM = Window:CreateTab("Misc", 4483362458)
 
@@ -1724,10 +1841,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.7  |  Tower of Hell")
+TabM:CreateLabel("ch4rlies hub  |  v10.8  |  Tower of Hell")
 TabM:CreateLabel("Auto Farm instant detection  |  Faster climb  |  Infinite Zoom")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.7","Auto Farm  fixed!  v10.7",5)
+Notify("ch4rlies hub v10.8","Auto Farm fixed!  v10.8",5)
