@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.9
+-- ch4rlies hub | Tower of Hell | v11.0
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -805,6 +805,8 @@ local function BezierClimb(targetPos, onDone)
         local arcLen  = (p0-p1).Magnitude + (p1-p2).Magnitude + (p2-p3).Magnitude
         local duration = math.max(arcLen / CLIMB_SPEED, 0.5)
         local steps    = math.max(math.ceil(duration / STEP_DT), 10)
+        -- Stop jitter 5 steps before landing so approach path is clean
+        local jitterCutoff = steps - 5
 
         local completed = true
         for i = 1, steps do
@@ -813,16 +815,20 @@ local function BezierClimb(targetPos, onDone)
             if not hrp2 then completed = false break end
 
             local easedT = EaseInOut(i / steps)
-            local pos    = Bezier3(p0, p1, p2, p3, easedT) + Jitter(i)
+            local pos    = Bezier3(p0, p1, p2, p3, easedT)
+            if i <= jitterCutoff then pos = pos + Jitter(i) end
 
             hrp2.CFrame = CFrame.new(pos)
-            -- NO velocity zeroing - physics runs naturally
             task.wait(STEP_DT)
         end
 
-        -- Final snap to exact target (no jitter on landing)
+        -- Final hard snap + single velocity zero (not a loop - safe for anti-cheat)
         local hrp3 = HRP()
-        if hrp3 then hrp3.CFrame = CFrame.new(targetPos) end
+        if hrp3 then
+            hrp3.CFrame = CFrame.new(targetPos)
+            hrp3.AssemblyLinearVelocity  = Vector3.zero
+            hrp3.AssemblyAngularVelocity = Vector3.zero
+        end
 
         _climbActive = false
         if not wasNoclip then SetNoclip(false) end
@@ -831,7 +837,6 @@ local function BezierClimb(targetPos, onDone)
 end
 
 -- FarmClimb: for AUTO FARM use - NO noclip toggle (server-visible)
--- Uses Heartbeat instead of task.wait for frame-accurate timing
 local function FarmClimb(targetPos, onDone)
     if _climbActive then return end
     _climbActive = true
@@ -849,6 +854,7 @@ local function FarmClimb(targetPos, onDone)
         local arcLen  = (p0-p1).Magnitude + (p1-p2).Magnitude + (p2-p3).Magnitude
         local duration = math.max(arcLen / CLIMB_SPEED, 0.5)
         local steps    = math.max(math.ceil(duration / STEP_DT), 10)
+        local jitterCutoff = steps - 5
 
         local completed = true
         for i = 1, steps do
@@ -857,14 +863,19 @@ local function FarmClimb(targetPos, onDone)
             if not hrp2 then completed = false break end
 
             local easedT = EaseInOut(i / steps)
-            local pos    = Bezier3(p0, p1, p2, p3, easedT) + Jitter(i)
+            local pos    = Bezier3(p0, p1, p2, p3, easedT)
+            if i <= jitterCutoff then pos = pos + Jitter(i) end
 
             hrp2.CFrame = CFrame.new(pos)
             task.wait(STEP_DT)
         end
 
         local hrp3 = HRP()
-        if hrp3 then hrp3.CFrame = CFrame.new(targetPos) end
+        if hrp3 then
+            hrp3.CFrame = CFrame.new(targetPos)
+            hrp3.AssemblyLinearVelocity  = Vector3.zero
+            hrp3.AssemblyAngularVelocity = Vector3.zero
+        end
 
         _climbActive = false
         if completed and onDone then onDone() end
@@ -1524,11 +1535,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.9",
+    LoadingSubtitle = "Tower of Hell  |  v11.0",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v109"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v110"},
     KeySystem = false,
 })
 
@@ -1853,10 +1864,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.9  |  Tower of Hell")
+TabM:CreateLabel("ch4rlies hub  |  v11.0  |  Tower of Hell")
 TabM:CreateLabel("Auto Farm instant detection  |  Faster climb  |  Infinite Zoom")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.9","Auto Farm fixed!  v10.9",5)
+Notify("ch4rlies hub v11.0","Auto Farm fixed!  v11.0",5)
