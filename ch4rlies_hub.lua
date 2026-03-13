@@ -1,4 +1,4 @@
--- ch4rlies hub | Tower of Hell | v10.5
+-- ch4rlies hub | Tower of Hell | v10.6
 -- 100% ASCII | Lua 5.1 compatible
 
 -- ============================================================
@@ -742,9 +742,8 @@ end
 --
 -- The ease-in-out curve is applied to the t parameter so the
 -- whole motion accelerates, cruises, then decelerates smoothly.
--- Speed = 120 studs/sec for auto farm feel (safe, well under ToH ban threshold)
--- Manual button still uses this same speed - feels fast and clean.
-local CLIMB_SPEED = 120  -- studs/sec
+-- Speed = 80 studs/sec - fast but smooth
+local CLIMB_SPEED = 80
 
 local function EaseInOut(t)
     return t * t * (3 - 2 * t)
@@ -864,9 +863,11 @@ local function AutoComplete()
     -- Priority 1: direct FinishGlow path (confirmed working)
     pcall(function()
         local fg = workspace.tower.sections.finish.FinishGlow
-        -- Use CFrame position directly + small Y offset to stand on it
-        target = fg.CFrame.Position + Vector3.new(0, 3, 0)
-        label  = "FinishGlow"
+        -- Guard: must have a parent (not being destroyed)
+        if fg and fg.Parent then
+            target = fg.CFrame.Position + Vector3.new(0, 3, 0)
+            label  = "FinishGlow"
+        end
     end)
 
     -- Priority 2: highest section's start part
@@ -1265,49 +1266,47 @@ LP.CharacterAdded:Connect(function(char)
     if cfg.AutoRespawn then SetAutoRespawn(true)   end
 
     -- AUTO FARM: wait for the NEW tower to be fully generated,
-    -- then call AutoComplete() - identical to pressing it manually.
+    -- then call AutoComplete() identically to a manual button press.
     --
-    -- Tower removal detection is pure-event-driven using a BindableEvent
-    -- as a one-shot signal. No polling loop = fires instantly the moment
-    -- ToH destroys workspace.tower, never waits the full timeout.
+    -- Why BindableEvent was broken (race condition):
+    --   ChildRemoved can fire BEFORE sig.Event:Wait() is reached.
+    --   In Roblox, a BindableEvent.Fire() before .Wait() loses the
+    --   signal completely. So on rounds 2+ the event was missed and
+    --   the 20-second timeout fired instead - causing the long delay.
+    --
+    -- Fix: store the current FinishGlow instance reference before
+    --   the round ends, then poll every 0.1s until workspace gives
+    --   us a DIFFERENT instance. Different reference = new tower.
+    --   No events, no race conditions, max 0.1s reaction time.
     if _autoFarmActive then
         task.spawn(function()
-            -- Step 1: wait for the OLD tower to be removed
-            local oldTower = workspace:FindFirstChild("tower")
-            if oldTower and oldTower.Parent then
-                -- Pure event-driven: BindableEvent fires the instant tower is removed
-                local sig  = Instance.new("BindableEvent")
-                local conn = workspace.ChildRemoved:Connect(function(child)
-                    if child == oldTower then
-                        sig:Fire()
-                    end
-                end)
-                -- Guard: if it was removed between FindFirstChild and Connect, fire now
-                if not workspace:FindFirstChild("tower") then
-                    sig:Fire()
-                else
-                    -- Timeout safety: fire after 20s no matter what
-                    task.delay(20, function() sig:Fire() end)
-                    sig.Event:Wait()
-                end
-                conn:Disconnect()
-                sig:Destroy()
-            end
-
-            if not _autoFarmActive then return end
-
-            -- Step 2: event-driven wait for the NEW tower and its FinishGlow
-            local ok = pcall(function()
-                local tower    = workspace:WaitForChild("tower",    30)
-                local sections = tower:WaitForChild("sections",     30)
-                local finish   = sections:WaitForChild("finish",    30)
-                finish:WaitForChild("FinishGlow", 30)
+            -- Snapshot the current FinishGlow (may be nil if between rounds)
+            local oldFG = nil
+            pcall(function()
+                oldFG = workspace.tower.sections.finish.FinishGlow
             end)
 
-            if not ok or not _autoFarmActive then return end
+            -- Poll until we see a DIFFERENT FinishGlow instance
+            -- (different reference = new tower generated this round)
+            local newFG   = nil
+            local deadline = tick() + 35
+            while tick() < deadline do
+                if not _autoFarmActive then return end
+                task.wait(0.1)
+                local ok, fg = pcall(function()
+                    return workspace.tower.sections.finish.FinishGlow
+                end)
+                -- Valid new instance that isn't the old one
+                if ok and fg and fg.Parent and fg ~= oldFG then
+                    newFG = fg
+                    break
+                end
+            end
 
-            -- Tiny settle delay (let the tower finish generating)
-            task.wait(0.3)
+            if not newFG or not _autoFarmActive then return end
+
+            -- Tiny settle so the tower fully streams in
+            task.wait(0.2)
             if not _autoFarmActive then return end
 
             _autoFarmRounds = _autoFarmRounds + 1
@@ -1329,11 +1328,11 @@ end)
 local Window = Rayfield:CreateWindow({
     Name            = "ch4rlies hub  -  Tower of Hell",
     LoadingTitle    = "ch4rlies hub",
-    LoadingSubtitle = "Tower of Hell  |  v10.5",
+    LoadingSubtitle = "Tower of Hell  |  v10.6",
     Theme           = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
-    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v105"},
+    ConfigurationSaving    = {Enabled=true, FileName="ch4rlies_toh_v106"},
     KeySystem = false,
 })
 
@@ -1651,10 +1650,10 @@ TabM:CreateSlider({Name="Lag Intensity",Range={50,500},Increment=25,
     end})
 
 TabM:CreateSection("Info")
-TabM:CreateLabel("ch4rlies hub  |  v10.5  |  Tower of Hell")
+TabM:CreateLabel("ch4rlies hub  |  v10  |  Tower of Hell")
 TabM:CreateLabel("Auto Farm instant detection  |  Faster climb  |  Infinite Zoom")
 TabM:CreateLabel("All bypasses active on load and respawn")
 
 Rayfield:LoadConfiguration()
 task.wait(0.8)
-Notify("ch4rlies hub v10.5","Auto Farm faster + Infinite Zoom added!",5)
+Notify("ch4rlies hub v10.6","Auto Farm fixed!  v10.6",5)
